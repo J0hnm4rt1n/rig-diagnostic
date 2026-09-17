@@ -1,0 +1,8 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+
+# Personal HWiNFO logs / screenshots from local testing — never commit real sensor data
+*.csv.local
+/real_logs/
+/shot_*.png
