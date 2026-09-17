@@ -4,7 +4,7 @@ A single-file, client-side HWiNFO log analyzer. Drop in an HWiNFO CSV sensor log
 
 **Status: BETA.** This is a hobby project shared for free with a small group of friends for now. Feedback and bug reports are welcome — see [Issues](../../issues).
 
-**[Open the tool](https://YOUR-USERNAME.github.io/rig-diagnostic/)** — nothing to install, runs entirely in your browser. (If that link 404s, GitHub Pages may still be deploying — give it a minute after the repo is set up.)
+**[Open the tool](https://J0hnm4rt1n.github.io/rig-diagnostic/)** — nothing to install, runs entirely in your browser. (If that link 404s, GitHub Pages may still be deploying — give it a minute after the repo is set up.)
 
 ## Why
 
@@ -27,7 +27,7 @@ There are no npm packages, no backend, no database, and nothing to configure. `i
 ## Getting started
 
 1. Download and install [HWiNFO](https://www.hwinfo.com/download/) if you don't already have it (it's free; grab the regular installer, not "Portable" unless you prefer that).
-2. Open the tool — use the [live link](https://YOUR-USERNAME.github.io/rig-diagnostic/) above, or download `index.html` and double-click it. Either way it's the same file, running entirely in your browser: no install, no server, no build step.
+2. Open the tool — use the [live link](https://J0hnm4rt1n.github.io/rig-diagnostic/) above, or download `index.html` and double-click it. Either way it's the same file, running entirely in your browser: no install, no server, no build step.
 3. In HWiNFO, open the Sensors window, click **Start Logging**, and save a `.csv` — ideally while doing whatever you want to diagnose (a game session, a stress test, idle).
 4. Drag that `.csv` onto the page, or use the **Add log** button.
 5. Start on the **Summary** page for the headline findings, then dig into Thermals / Power / Performance / Gaming / Memory / Network as needed. Most panels have a small **Copy** button in the corner — it copies that section as plain text, handy for pasting into a search engine, a forum post, or an AI chat if you want a second opinion.
