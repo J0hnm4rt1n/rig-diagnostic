@@ -187,10 +187,7 @@ async function addFiles(fileList) {
   const incoming = Array.from(fileList).filter(f => /\.csv$/i.test(f.name));
   if (!incoming.length) { showToast('Please choose a .csv file exported from HWiNFO.', 'error'); return; }
 
-  // Real uploads replace the sample dataset — but only once we actually have a
-  // successfully parsed replacement, so a failed upload doesn't blank the page.
-  const hadDemo = STATE.files.some(f => f.isDemo);
-  const room = 4 - (hadDemo ? 0 : STATE.files.length);
+  const room = 4 - STATE.files.length;
   if (incoming.length > room) showToast(`Only ${room} more log${room === 1 ? '' : 's'} can be loaded (4 max) — using the first ${room}.`);
   const toLoad = incoming.slice(0, Math.max(0, room));
 
@@ -207,7 +204,6 @@ async function addFiles(fileList) {
       showToast(err.message || `Could not read "${file.name}".`, 'error');
     }
   }
-  if (parsedFiles.length && hadDemo) { STATE.files = []; STATE.nextColorIdx = 0; }
   for (const parsed of parsedFiles) {
     parsed.color = FILE_COLORS[STATE.nextColorIdx % 4];
     STATE.nextColorIdx++;
@@ -219,25 +215,10 @@ async function addFiles(fileList) {
 
 function removeFile(id) {
   STATE.files = STATE.files.filter(f => f.id !== id);
-  if (!STATE.files.length) loadDemo();
-  else render();
-}
-function clearAllFiles() { STATE.files = []; loadDemo(); }
-
-function loadDemo() {
-  try {
-    const parsed = parseHWiNFOFile('BF_test.csv (sample)', DEMO_CSV_TEXT, { isDemo: true });
-    parsed.id = 'demo-file';
-    parsed.label = loadSavedLabel(parsed);
-    parsed.color = FILE_COLORS[0];
-    STATE.nextColorIdx = 1;
-    STATE.files = [parsed];
-    STATE.raw.fileId = parsed.id;
-  } catch (err) {
-    console.error(err);
-  }
+  if (!STATE.files.length) { STATE.nextColorIdx = 0; STATE.raw.fileId = null; }
   render();
 }
+function clearAllFiles() { STATE.files = []; STATE.nextColorIdx = 0; STATE.raw.fileId = null; render(); }
 
 // ---------- Derived data (recomputed each render — datasets are small enough) ----------
 function getOrdered() { return orderFilesByPriority(STATE.files); }
@@ -310,7 +291,7 @@ function renderTopbar() {
     <div class="file-chip ${isPriority ? 'priority' : ''}" data-id="${f.id}" title="${escapeHtml(f.fileName)}${f.label ? ' — labeled "' + f.label + '"' : ''}${isBest ? ' — best overall run (lowest temps, best frame performance among loaded logs)' : ''}">
       ${isBest ? `<span class="best-star">${icon('star')}</span>` : ''}
       <span class="dot" style="background:${f.color}"></span>
-      <span class="fname">${f.isDemo && !f.label ? 'Sample: ' : ''}${escapeHtml(displayName(f))}</span>
+      <span class="fname">${escapeHtml(displayName(f))}</span>
       <button class="edit-label" data-id="${f.id}" title="Rename this session">${icon('pencil')}</button>
       <span class="ftime">${f.startTime ? fmtDate(f.startTime) : ''}</span>
       ${isPriority ? '<span class="priority-tag">newest</span>' : ''}
@@ -729,17 +710,13 @@ function boolMetricBar(label, cols, opts) {
 
 // ---------- Views ----------
 function renderSummary(container, ordered) {
-  const anyDemo = ordered.some(f => f.isDemo);
   const { top } = topIssuesAcrossFiles(ordered);
   const newest = ordered[0];
 
   let html = '';
-  if (anyDemo) {
-    html += `<div class="sample-banner">${icon('file')}<span>You're viewing a sample log (a real HWiNFO capture) so you can see how this tool works. Add your own to analyze your rig.</span><button class="btn primary" id="btn-replace-sample">Add my log</button></div>`;
-  }
   html += `<div class="page-head"><div><h1>Summary</h1><p>${ordered.length} log${ordered.length > 1 ? 's' : ''} loaded, spanning ${fmtDur(ordered.reduce((a, f) => a + f.durationMs, 0))} of recorded telemetry. Most recent capture is treated as the priority file.</p></div></div>`;
 
-  const sysLabel = anyDemo && !newest.label ? 'sample log' : displayName(newest);
+  const sysLabel = displayName(newest);
   const sysCopyable = hasSystemInfo(newest.systemInfo);
   if (sysCopyable) COPY_REGISTRY['summary-sysinfo'] = buildSystemOverviewText(newest.systemInfo, sysLabel);
   html += `<div class="panel"><div class="panel-head"><h3>System overview</h3><div style="display:flex;align-items:center;gap:10px;"><span class="sub">from ${escapeHtml(sysLabel)}</span>${sysCopyable ? copyButtonHtml('summary-sysinfo', 'system overview') : ''}</div></div>${systemSpecHtml(newest.systemInfo)}</div>`;
@@ -779,8 +756,6 @@ function renderSummary(container, ordered) {
 
   container.innerHTML = html;
   mountTileSparks(container, ordered);
-  const replaceBtn = container.querySelector('#btn-replace-sample');
-  if (replaceBtn) replaceBtn.addEventListener('click', () => els.fileInput.click());
   container.querySelectorAll('.row-remove').forEach(btn => btn.addEventListener('click', () => removeFile(btn.dataset.id)));
 }
 
@@ -1342,7 +1317,7 @@ function buildReportText(ordered) {
 
   lines.push('LOGS LOADED' + (ordered.length > 1 ? ' (newest first)' : ''));
   for (const f of ordered) {
-    lines.push(`- ${displayName(f)}${f.isDemo ? ' [sample log]' : ''}: ${fmtDate(f.startTime)} to ${fmtDate(f.endTime)} (${fmtDur(f.durationMs)}, ${f.nRows.toLocaleString()} samples)`);
+    lines.push(`- ${displayName(f)}: ${fmtDate(f.startTime)} to ${fmtDate(f.endTime)} (${fmtDur(f.durationMs)}, ${f.nRows.toLocaleString()} samples)`);
   }
   lines.push('');
 
@@ -1550,4 +1525,4 @@ function render() {
 }
 
 initShell();
-loadDemo();
+render();

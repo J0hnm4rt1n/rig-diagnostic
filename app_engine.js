@@ -218,7 +218,6 @@ function parseHWiNFOFile(fileName, text, meta) {
     startTime, endTime, durationMs: (startTime && endTime) ? (endTime - startTime) : 0,
     systemInfo: extractSystemInfo(hwRow),
     lastModified: (meta && meta.lastModified) || null,
-    isDemo: !!(meta && meta.isDemo),
   };
 }
 

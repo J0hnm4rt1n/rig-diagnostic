@@ -2,13 +2,10 @@ const fs = require('fs');
 const path = __dirname;
 
 const shell = fs.readFileSync(path + '/artifact.html', 'utf8');
-const demoCsv = fs.readFileSync(path + '/demo_sample.csv', 'utf8');
 const parts = ['app_engine.js', 'app_specs.js', 'app_rules.js', 'app_gaming.js', 'app_memory.js', 'app_compare.js', 'app_charts.js'].map(f => fs.readFileSync(path + '/' + f, 'utf8'));
 const mainJs = fs.readFileSync(path + '/app_main.js', 'utf8');
 
 const script = `<script>
-const DEMO_CSV_TEXT = ${JSON.stringify(demoCsv)};
-
 ${parts.join('\n\n')}
 
 ${mainJs}
