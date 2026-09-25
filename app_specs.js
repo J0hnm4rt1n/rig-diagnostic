@@ -25,11 +25,20 @@ const CPU_SPECS = [
   { match: /Ultra 7 265K/i, name: 'Core Ultra 7 265K', pptW: 250, tjMaxC: 100 },
 ];
 
+// Hot-spot level used when a card has no documented hot-spot throttle point of its own.
+// Shared by the rule engine and the headroom panel so the two never disagree.
+const DEFAULT_GPU_HOTSPOT_LIMIT_C = 100;
+
+// Shown only when a log for one of the `mayHideHotspot` cards has no hot-spot column —
+// some driver/HWiNFO combinations report one for Blackwell and some don't, so this
+// can't be stated unconditionally.
+const MISSING_HOTSPOT_NOTE = 'No GPU hot-spot sensor was found in this log. Blackwell (RTX 50-series) cards don\'t expose one on some driver/HWiNFO versions, so only core/edge temperature is available here.';
+
 const GPU_SPECS = [
-  { match: /RTX 5090/i, name: 'GeForce RTX 5090', tbpW: 575, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
-  { match: /RTX 5080/i, name: 'GeForce RTX 5080', tbpW: 360, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
-  { match: /RTX 5070 Ti/i, name: 'GeForce RTX 5070 Ti', tbpW: 300, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
-  { match: /RTX 5070(?! Ti)/i, name: 'GeForce RTX 5070', tbpW: 250, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
+  { match: /RTX 5090/i, name: 'GeForce RTX 5090', tbpW: 575, coreThrottleC: 90, mayHideHotspot: true },
+  { match: /RTX 5080/i, name: 'GeForce RTX 5080', tbpW: 360, coreThrottleC: 90, mayHideHotspot: true },
+  { match: /RTX 5070 Ti/i, name: 'GeForce RTX 5070 Ti', tbpW: 300, coreThrottleC: 90, mayHideHotspot: true },
+  { match: /RTX 5070(?! Ti)/i, name: 'GeForce RTX 5070', tbpW: 250, coreThrottleC: 90, mayHideHotspot: true },
   { match: /RTX 4090/i, name: 'GeForce RTX 4090', tbpW: 450, coreThrottleC: 90, hotspotThrottleC: 105 },
   { match: /RTX 4080/i, name: 'GeForce RTX 4080', tbpW: 320, coreThrottleC: 90, hotspotThrottleC: 105 },
   { match: /RTX 4070 Ti/i, name: 'GeForce RTX 4070 Ti', tbpW: 285, coreThrottleC: 90, hotspotThrottleC: 105 },
@@ -57,4 +66,11 @@ function matchGpuSpec(gpuLabels) {
 function getHardwareSpecs(file) {
   const sys = file.systemInfo || {};
   return { cpuSpec: matchCpuSpec(sys.cpu), gpuSpec: matchGpuSpec(sys.gpus) };
+}
+
+// Context note to show alongside a GPU spec for this particular log (or null).
+function gpuSpecNoteFor(gpuSpec, hasHotspotSensor) {
+  if (!gpuSpec) return null;
+  if (gpuSpec.mayHideHotspot && !hasHotspotSensor) return MISSING_HOTSPOT_NOTE;
+  return gpuSpec.note || null;
 }

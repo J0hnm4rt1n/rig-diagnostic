@@ -30,11 +30,28 @@ function parseCSV(text) {
 function looksLikeDate(s) { if (!s) return false; s = s.trim(); return /^\d{1,2}[./]\d{1,2}[./]\d{2,4}$/.test(s); }
 function looksLikeTime(s) { if (!s) return false; s = s.trim(); return /^\d{1,2}:\d{1,2}:\d{1,2}(\.\d+)?$/.test(s); }
 
-function parseDateTime(dateStr, timeStr) {
+// Slash-separated dates are ambiguous (US month/day vs. day/month elsewhere), so the
+// order is decided once per file: any first part above 12 means day-first, any second
+// part above 12 means month-first. If every date in the log fits both, month-first is kept.
+function detectSlashDateOrder(dateStrs) {
+  for (const s of dateStrs) {
+    if (!s || !s.includes('/')) continue;
+    const p = s.trim().split('/').map(Number);
+    if (p[0] > 12) return 'dmy';
+    if (p[1] > 12) return 'mdy';
+  }
+  return 'mdy';
+}
+
+function parseDateTime(dateStr, timeStr, slashOrder) {
   dateStr = (dateStr || '').trim(); timeStr = (timeStr || '').trim();
   let d, mo, y;
   if (dateStr.includes('.')) { const p = dateStr.split('.').map(Number); d = p[0]; mo = p[1]; y = p[2]; }
-  else if (dateStr.includes('/')) { const p = dateStr.split('/').map(Number); mo = p[0]; d = p[1]; y = p[2]; }
+  else if (dateStr.includes('/')) {
+    const p = dateStr.split('/').map(Number);
+    if (slashOrder === 'dmy') { d = p[0]; mo = p[1]; } else { mo = p[0]; d = p[1]; }
+    y = p[2];
+  }
   else return null;
   if (y < 100) y += 2000;
   const tparts = timeStr.split(':');
@@ -44,7 +61,17 @@ function parseDateTime(dateStr, timeStr) {
   const wholeSec = Math.floor(ss);
   const ms = Math.round((ss - wholeSec) * 1000);
   const dt = new Date(y, mo - 1, d, hh, mm, wholeSec, ms);
-  return isNaN(dt.getTime()) ? null : dt;
+  // Date() silently rolls out-of-range parts over (month 13 -> next year), so reject
+  // anything that didn't land on the day/month it was given.
+  if (isNaN(dt.getTime()) || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return dt;
+}
+
+// Drive labels carry the drive's serial number in parentheses, e.g.
+// "Samsung SSD 970 EVO Plus 2TB (S4AB12345678X) [E:]". Strip it so it doesn't end up
+// in the overview, the plain-text report, or anything copied to a forum post.
+function stripDriveSerial(label) {
+  return String(label || '').replace(/\s*\((?=[A-Z0-9_-]*\d)[A-Z0-9_-]{8,}\)/gi, '');
 }
 
 const CATEGORY_RULES = [
@@ -110,7 +137,7 @@ function extractSystemInfo(hwRow) {
       if (!info.ram.includes(label)) info.ram.push(label);
     }
     else if (low.startsWith('drive:')) {
-      const clean = s.replace(/^drive:\s*/i, '');
+      const clean = stripDriveSerial(s.replace(/^drive:\s*/i, ''));
       if (!info.drives.includes(clean)) info.drives.push(clean);
     }
     else if (low.startsWith('network:')) {
@@ -158,13 +185,14 @@ function parseHWiNFOFile(fileName, text, meta) {
 
   const nRows = dataRows.length;
   const timestamps = new Array(nRows);
+  const slashOrder = detectSlashDateOrder(dataRows.map(r => r[0]));
   const isNumericCol = new Array(numCols).fill(true);
   const isBooleanCol = new Array(numCols).fill(true);
   const raw = columns.map(() => new Array(nRows));
 
   for (let r = 0; r < nRows; r++) {
     const row = dataRows[r];
-    timestamps[r] = parseDateTime(row[0], row[1]);
+    timestamps[r] = parseDateTime(row[0], row[1], slashOrder);
     for (let c = 0; c < numCols; c++) {
       const cell = c < row.length ? row[c] : '';
       const v = cell == null ? '' : cell.trim();
@@ -213,8 +241,19 @@ function parseHWiNFOFile(fileName, text, meta) {
   let startTime = null, endTime = null;
   for (const t of timestamps) { if (t) { if (!startTime || t < startTime) startTime = t; if (!endTime || t > endTime) endTime = t; } }
 
+  // HWiNFO writes one row per polling interval (its "polling period" setting), so this is
+  // how much time each row summarizes — used by the gaming analysis to tell whether rows
+  // are fine-grained enough to show frame-time spikes at all.
+  const gaps = [];
+  for (let r = 1; r < nRows; r++) {
+    const a = timestamps[r - 1], b = timestamps[r];
+    if (a && b && b > a) gaps.push(b - a);
+  }
+  gaps.sort((a, b) => a - b);
+  const sampleIntervalMs = gaps.length ? gaps[Math.floor(gaps.length / 2)] : null;
+
   return {
-    fileName, columns, timestamps, nRows,
+    fileName, columns, timestamps, nRows, sampleIntervalMs,
     startTime, endTime, durationMs: (startTime && endTime) ? (endTime - startTime) : 0,
     systemInfo: extractSystemInfo(hwRow),
     lastModified: (meta && meta.lastModified) || null,

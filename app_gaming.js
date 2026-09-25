@@ -17,10 +17,17 @@ function getPresentMonProcess(file) {
 }
 function isNonGameProcess(procName) { return !!procName && NON_GAME_PROCESSES.has(procName.toLowerCase()); }
 
-// Only frames faster than this (i.e. shorter frame time) count as "active" gameplay —
-// excludes idle desktop stalls where HWiNFO still logs a (huge) "frame" while nothing
-// is being rendered.
+// Each HWiNFO row is one polling interval, and its PresentMon columns are averages over
+// every frame rendered in that interval — so a row is a *sample*, not a frame. Everything
+// below works per sample. Only samples whose average frame time is under this cap count
+// as "active" gameplay — excludes idle desktop stalls where nothing is being rendered.
 const ACTIVE_FRAME_TIME_CAP_MS = 100; // ~10 FPS floor
+
+// Above this polling interval a single hitch is averaged in with hundreds of normal
+// frames and can't show up as a spike, so stutter detection is skipped rather than
+// reporting a misleadingly clean (or noisy) result.
+const STUTTER_MAX_SAMPLE_INTERVAL_MS = 2000;
+function stutterTooCoarse(file) { return file.sampleIntervalMs != null && file.sampleIntervalMs > STUTTER_MAX_SAMPLE_INTERVAL_MS; }
 
 function activeFrameIndices(file) {
   const km = resolveKeyMetrics(file);
@@ -31,9 +38,9 @@ function activeFrameIndices(file) {
   return { ft, idx };
 }
 
-// Compares per-frame GPU Busy vs CPU Busy time (both derived from the same PresentMon
-// capture) across active frames: whichever is closer to the full frame time is treated
-// as that frame's bottleneck. This is a simplified heuristic, not a cycle-accurate
+// Compares average GPU Busy vs CPU Busy time (both derived from the same PresentMon
+// capture) across active samples: whichever is closer to the full frame time is treated
+// as that sample's bottleneck. This is a simplified heuristic, not a cycle-accurate
 // profiler result, and is presented as such in the UI.
 function computeBottleneck(file) {
   const active = activeFrameIndices(file);
@@ -52,8 +59,10 @@ function computeBottleneck(file) {
   return { gpuBoundPct: gpuBound / counted, cpuBoundPct: cpuBound / counted, sampleCount: counted };
 }
 
-// Flags frames far slower than the session's own typical (active) frame time.
+// Flags samples whose average frame time is far above the session's own typical value.
+// Returns null when the log's polling interval is too coarse for this to mean anything.
 function detectStutters(file) {
+  if (stutterTooCoarse(file)) return null;
   const active = activeFrameIndices(file);
   if (!active || active.idx.length < 20) return null;
   const vals = active.idx.map(r => active.ft.series[r]).sort((a, b) => a - b);
@@ -103,6 +112,8 @@ function gamingSummary(file) {
     isGame: proc ? !isNonGameProcess(proc) : null,
     bottleneck: computeBottleneck(file),
     stutter: detectStutters(file),
+    sampleIntervalMs: file.sampleIntervalMs,
+    stutterTooCoarse: stutterTooCoarse(file),
     pacing: framePacingCheck(file),
   };
 }

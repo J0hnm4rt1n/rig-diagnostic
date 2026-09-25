@@ -1,3 +1,9 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Free, client-side HWiNFO log analyzer: thermals, power, gaming frame pacing, memory config and before/after comparisons. Logs never leave your browser.">
 <title>Rig Diagnostic</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -500,6 +506,8 @@
     * { transition: none !important; animation: none !important; }
   }
 </style>
+</head>
+<body>
 <div class="app">
   <aside class="rail">
     <div class="brand">
@@ -571,11 +579,28 @@ function parseCSV(text) {
 function looksLikeDate(s) { if (!s) return false; s = s.trim(); return /^\d{1,2}[./]\d{1,2}[./]\d{2,4}$/.test(s); }
 function looksLikeTime(s) { if (!s) return false; s = s.trim(); return /^\d{1,2}:\d{1,2}:\d{1,2}(\.\d+)?$/.test(s); }
 
-function parseDateTime(dateStr, timeStr) {
+// Slash-separated dates are ambiguous (US month/day vs. day/month elsewhere), so the
+// order is decided once per file: any first part above 12 means day-first, any second
+// part above 12 means month-first. If every date in the log fits both, month-first is kept.
+function detectSlashDateOrder(dateStrs) {
+  for (const s of dateStrs) {
+    if (!s || !s.includes('/')) continue;
+    const p = s.trim().split('/').map(Number);
+    if (p[0] > 12) return 'dmy';
+    if (p[1] > 12) return 'mdy';
+  }
+  return 'mdy';
+}
+
+function parseDateTime(dateStr, timeStr, slashOrder) {
   dateStr = (dateStr || '').trim(); timeStr = (timeStr || '').trim();
   let d, mo, y;
   if (dateStr.includes('.')) { const p = dateStr.split('.').map(Number); d = p[0]; mo = p[1]; y = p[2]; }
-  else if (dateStr.includes('/')) { const p = dateStr.split('/').map(Number); mo = p[0]; d = p[1]; y = p[2]; }
+  else if (dateStr.includes('/')) {
+    const p = dateStr.split('/').map(Number);
+    if (slashOrder === 'dmy') { d = p[0]; mo = p[1]; } else { mo = p[0]; d = p[1]; }
+    y = p[2];
+  }
   else return null;
   if (y < 100) y += 2000;
   const tparts = timeStr.split(':');
@@ -585,7 +610,17 @@ function parseDateTime(dateStr, timeStr) {
   const wholeSec = Math.floor(ss);
   const ms = Math.round((ss - wholeSec) * 1000);
   const dt = new Date(y, mo - 1, d, hh, mm, wholeSec, ms);
-  return isNaN(dt.getTime()) ? null : dt;
+  // Date() silently rolls out-of-range parts over (month 13 -> next year), so reject
+  // anything that didn't land on the day/month it was given.
+  if (isNaN(dt.getTime()) || dt.getMonth() !== mo - 1 || dt.getDate() !== d) return null;
+  return dt;
+}
+
+// Drive labels carry the drive's serial number in parentheses, e.g.
+// "Samsung SSD 970 EVO Plus 2TB (S4AB12345678X) [E:]". Strip it so it doesn't end up
+// in the overview, the plain-text report, or anything copied to a forum post.
+function stripDriveSerial(label) {
+  return String(label || '').replace(/\s*\((?=[A-Z0-9_-]*\d)[A-Z0-9_-]{8,}\)/gi, '');
 }
 
 const CATEGORY_RULES = [
@@ -651,7 +686,7 @@ function extractSystemInfo(hwRow) {
       if (!info.ram.includes(label)) info.ram.push(label);
     }
     else if (low.startsWith('drive:')) {
-      const clean = s.replace(/^drive:\s*/i, '');
+      const clean = stripDriveSerial(s.replace(/^drive:\s*/i, ''));
       if (!info.drives.includes(clean)) info.drives.push(clean);
     }
     else if (low.startsWith('network:')) {
@@ -699,13 +734,14 @@ function parseHWiNFOFile(fileName, text, meta) {
 
   const nRows = dataRows.length;
   const timestamps = new Array(nRows);
+  const slashOrder = detectSlashDateOrder(dataRows.map(r => r[0]));
   const isNumericCol = new Array(numCols).fill(true);
   const isBooleanCol = new Array(numCols).fill(true);
   const raw = columns.map(() => new Array(nRows));
 
   for (let r = 0; r < nRows; r++) {
     const row = dataRows[r];
-    timestamps[r] = parseDateTime(row[0], row[1]);
+    timestamps[r] = parseDateTime(row[0], row[1], slashOrder);
     for (let c = 0; c < numCols; c++) {
       const cell = c < row.length ? row[c] : '';
       const v = cell == null ? '' : cell.trim();
@@ -754,8 +790,19 @@ function parseHWiNFOFile(fileName, text, meta) {
   let startTime = null, endTime = null;
   for (const t of timestamps) { if (t) { if (!startTime || t < startTime) startTime = t; if (!endTime || t > endTime) endTime = t; } }
 
+  // HWiNFO writes one row per polling interval (its "polling period" setting), so this is
+  // how much time each row summarizes — used by the gaming analysis to tell whether rows
+  // are fine-grained enough to show frame-time spikes at all.
+  const gaps = [];
+  for (let r = 1; r < nRows; r++) {
+    const a = timestamps[r - 1], b = timestamps[r];
+    if (a && b && b > a) gaps.push(b - a);
+  }
+  gaps.sort((a, b) => a - b);
+  const sampleIntervalMs = gaps.length ? gaps[Math.floor(gaps.length / 2)] : null;
+
   return {
-    fileName, columns, timestamps, nRows,
+    fileName, columns, timestamps, nRows, sampleIntervalMs,
     startTime, endTime, durationMs: (startTime && endTime) ? (endTime - startTime) : 0,
     systemInfo: extractSystemInfo(hwRow),
     lastModified: (meta && meta.lastModified) || null,
@@ -802,11 +849,20 @@ const CPU_SPECS = [
   { match: /Ultra 7 265K/i, name: 'Core Ultra 7 265K', pptW: 250, tjMaxC: 100 },
 ];
 
+// Hot-spot level used when a card has no documented hot-spot throttle point of its own.
+// Shared by the rule engine and the headroom panel so the two never disagree.
+const DEFAULT_GPU_HOTSPOT_LIMIT_C = 100;
+
+// Shown only when a log for one of the `mayHideHotspot` cards has no hot-spot column —
+// some driver/HWiNFO combinations report one for Blackwell and some don't, so this
+// can't be stated unconditionally.
+const MISSING_HOTSPOT_NOTE = 'No GPU hot-spot sensor was found in this log. Blackwell (RTX 50-series) cards don\'t expose one on some driver/HWiNFO versions, so only core/edge temperature is available here.';
+
 const GPU_SPECS = [
-  { match: /RTX 5090/i, name: 'GeForce RTX 5090', tbpW: 575, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
-  { match: /RTX 5080/i, name: 'GeForce RTX 5080', tbpW: 360, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
-  { match: /RTX 5070 Ti/i, name: 'GeForce RTX 5070 Ti', tbpW: 300, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
-  { match: /RTX 5070(?! Ti)/i, name: 'GeForce RTX 5070', tbpW: 250, coreThrottleC: 90, note: 'Blackwell (RTX 50-series) hides its hot-spot sensor from monitoring tools like HWiNFO, so only core/edge temperature is visible here.' },
+  { match: /RTX 5090/i, name: 'GeForce RTX 5090', tbpW: 575, coreThrottleC: 90, mayHideHotspot: true },
+  { match: /RTX 5080/i, name: 'GeForce RTX 5080', tbpW: 360, coreThrottleC: 90, mayHideHotspot: true },
+  { match: /RTX 5070 Ti/i, name: 'GeForce RTX 5070 Ti', tbpW: 300, coreThrottleC: 90, mayHideHotspot: true },
+  { match: /RTX 5070(?! Ti)/i, name: 'GeForce RTX 5070', tbpW: 250, coreThrottleC: 90, mayHideHotspot: true },
   { match: /RTX 4090/i, name: 'GeForce RTX 4090', tbpW: 450, coreThrottleC: 90, hotspotThrottleC: 105 },
   { match: /RTX 4080/i, name: 'GeForce RTX 4080', tbpW: 320, coreThrottleC: 90, hotspotThrottleC: 105 },
   { match: /RTX 4070 Ti/i, name: 'GeForce RTX 4070 Ti', tbpW: 285, coreThrottleC: 90, hotspotThrottleC: 105 },
@@ -834,6 +890,13 @@ function matchGpuSpec(gpuLabels) {
 function getHardwareSpecs(file) {
   const sys = file.systemInfo || {};
   return { cpuSpec: matchCpuSpec(sys.cpu), gpuSpec: matchGpuSpec(sys.gpus) };
+}
+
+// Context note to show alongside a GPU spec for this particular log (or null).
+function gpuSpecNoteFor(gpuSpec, hasHotspotSensor) {
+  if (!gpuSpec) return null;
+  if (gpuSpec.mayHideHotspot && !hasHotspotSensor) return MISSING_HOTSPOT_NOTE;
+  return gpuSpec.note || null;
 }
 
 
@@ -915,6 +978,12 @@ function resolveBoolMetrics(file) {
 }
 function findAllNumeric(file, re) { return file.columns.filter(c => re.test(c.name) && c.isNumeric && c.stats && c.stats.count > 0); }
 
+// PCIe counters that indicate an actual link fault (Recovery Count is deliberately not
+// one of them — see detectIssues). Shared with the Network & PCIe table.
+const PCIE_FAULT_PATTERNS = [/^Correctable Error Count/i, /^Non-Fatal Error Count/i, /^Fatal Error Count/i, /^Bad DLLP Count/i, /^Bad TLP Count/i, /^LCRC Error Count/i, /^Replay Count/i, /^Receiver Errors/i, /^NAKs Sent Count/i, /^NAKs Received Count/i];
+// How much a running-total counter went up within this log.
+function counterIncrease(col) { return col.stats.max - col.stats.min; }
+
 const SEVERITY_RANK = { critical: 4, serious: 3, warning: 2, info: 1 };
 function pctTrue(cols) { let t = 0, tot = 0; for (const c of cols) { t += c.boolStats.trueCount; tot += c.boolStats.total; } return tot ? t / tot : 0; }
 function fmtPct(x) { return `${Math.round(x * 100)}%`; }
@@ -927,6 +996,14 @@ function fmtDur(ms) {
   return `${h}h ${rm}m`;
 }
 function stripUnit(name) { return name.replace(/\s*\[.*\]$/, ''); }
+// Identifies the same physical sensor across logs (column indexes shift between logs,
+// and two devices can share a column name), so per-sensor issue ids stay distinct
+// within a log and still line up between logs.
+function sensorKey(col) { return `${col.hwLabel || ''}|${col.name}`; }
+function driveDisplayName(hwLabel) {
+  const clean = stripDriveSerial((hwLabel || '').replace(/^drive:\s*/i, '').replace(/^s\.m\.a\.r\.t\.?:\s*/i, ''));
+  return clean || 'Drive';
+}
 
 function detectIssues(file) {
   const km = resolveKeyMetrics(file);
@@ -972,9 +1049,9 @@ function detectIssues(file) {
   const vrmCols = findAllNumeric(file, /VRM.*Temperature|VDDCR_VDD VRM|VDDCR_SOC VRM/i);
   for (const col of vrmCols) {
     const s = col.stats;
-    if (s.max >= 100) add('vrm_temp_' + col.index, 'critical', `${stripUnit(col.name)} is very hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
+    if (s.max >= 100) add('vrm_temp:' + sensorKey(col), 'critical', `${stripUnit(col.name)} is very hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
       'Sustained high VRM temperatures shorten regulator lifespan and can trigger unexpected shutdowns. Improve airflow directly over the VRM heatsink (a case fan or an AIO pump-mounted fan aimed at the socket area helps a lot on compact boards), and confirm the VRM heatsink is properly seated with intact thermal pads.', col, 'Motherboard');
-    else if (s.max >= 90) add('vrm_temp_' + col.index, 'warning', `${stripUnit(col.name)} runs hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
+    else if (s.max >= 90) add('vrm_temp:' + sensorKey(col), 'warning', `${stripUnit(col.name)} runs hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
       'Keep an eye on this, especially in a compact case. A small fan directed at the VRM heatsink area is a cheap fix.', col, 'Motherboard');
   }
   if (km.gpu_temp) {
@@ -985,7 +1062,8 @@ function detectIssues(file) {
     const throttleT = gpuSpec ? gpuSpec.coreThrottleC : 90;
     const seriousT = throttleT - 2, warningT = throttleT - 10;
     const specNote = gpuSpec ? ` (identified as a ${gpuSpec.name})` : '';
-    if (s.max >= seriousT) add('gpu_temp', 'serious', 'GPU core temperature is high', `Peaked at ${s.max.toFixed(1)}°C${specNote}.${gpuSpec && gpuSpec.note ? ' ' + gpuSpec.note : ''}`,
+    const gpuNote = gpuSpecNoteFor(gpuSpec, !!km.gpu_hotspot);
+    if (s.max >= seriousT) add('gpu_temp', 'serious', 'GPU core temperature is high', `Peaked at ${s.max.toFixed(1)}°C${specNote}.${gpuNote ? ' ' + gpuNote : ''}`,
       "Check that the case has adequate intake for the card's fans, that the fan curve isn't too passive at high load, and that the card is seated flat. Consider a more aggressive fan curve or improved case airflow.", km.gpu_temp, 'GPU');
     else if (s.max >= warningT) add('gpu_temp', 'warning', 'GPU runs warm under load', `Peaked at ${s.max.toFixed(1)}°C${specNote}.`,
       'Likely fine for most cards, but check case airflow and fan curve if you want more headroom.', km.gpu_temp, 'GPU');
@@ -997,7 +1075,7 @@ function detectIssues(file) {
   }
   if (km.gpu_hotspot) {
     const s = km.gpu_hotspot.stats;
-    const hsThrottle = (gpuSpec && gpuSpec.hotspotThrottleC) ? gpuSpec.hotspotThrottleC : 100;
+    const hsThrottle = (gpuSpec && gpuSpec.hotspotThrottleC) ? gpuSpec.hotspotThrottleC : DEFAULT_GPU_HOTSPOT_LIMIT_C;
     if (s.max >= hsThrottle) add('gpu_hotspot', 'critical', 'GPU hot-spot temperature is very high', `Peaked at ${s.max.toFixed(1)}°C${gpuSpec ? ` (reference throttle point for a ${gpuSpec.name} is around ${hsThrottle}°C)` : ''}.`,
       'A hot spot this high, especially alongside a much cooler core/edge reading, often points to thermal paste or pad degradation rather than a genuinely underpowered cooler. Consider a repaste/repad, and if this is a recent purchase, it may be worth raising with the vendor.', km.gpu_hotspot, 'GPU');
     else if (s.max >= 90) add('gpu_hotspot', 'warning', 'GPU hot-spot temperature runs high', `Peaked at ${s.max.toFixed(1)}°C${km.gpu_temp ? ` vs. ${km.gpu_temp.stats.max.toFixed(1)}°C core edge` : ''}.`,
@@ -1025,9 +1103,10 @@ function detectIssues(file) {
   const remainingLifeCols = findAllNumeric(file, /Drive Remaining Life/i);
   for (const col of remainingLifeCols) {
     const s = col.stats;
-    if (s.min <= 70) add('drive_life_' + col.index, 'critical', 'Drive SMART health critically low', `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
+    const name = driveDisplayName(col.hwLabel);
+    if (s.min <= 70) add('drive_life:' + sensorKey(col), 'critical', `${name}: SMART health critically low`, `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
       "Back up this drive's data now and plan to replace it — SMART-reported remaining life this low means the drive's estimated endurance is largely used up.", col, 'Storage');
-    else if (s.min <= 90) add('drive_life_' + col.index, 'warning', 'Drive SMART health degrading', `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
+    else if (s.min <= 90) add('drive_life:' + sensorKey(col), 'warning', `${name}: SMART health degrading`, `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
       'Not urgent, but worth including this drive in your backup rotation and watching the trend over time.', col, 'Storage');
   }
   if (bm.drive_warning && pctTrue(bm.drive_warning) > 0) add('drive_warning', 'critical', 'Drive reported a SMART warning', 'One or more drives flagged a SMART warning condition during this session.',
@@ -1041,13 +1120,11 @@ function detectIssues(file) {
     const cur = tempByDrive.get(col.hwLabel);
     if (!cur || col.stats.max > cur.stats.max) tempByDrive.set(col.hwLabel, col);
   }
-  let driveIdx = 0;
   for (const [hwLabel, col] of tempByDrive.entries()) {
-    driveIdx++;
-    const label = hwLabel.replace(/^drive:\s*/i, '').replace(/^s\.m\.a\.r\.t\.?:\s*/i, '');
-    if (col.stats.max >= 75) add('drive_temp_' + driveIdx, 'serious', `${label} is running very hot`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
+    const label = driveDisplayName(hwLabel);
+    if (col.stats.max >= 75) add('drive_temp:' + hwLabel, 'serious', `${label} is running very hot`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
       'NVMe SSDs throttle (and can wear out faster) when consistently this hot. Add a heatsink or improve airflow across the M.2 slot.', col, 'Storage');
-    else if (col.stats.max >= 65) add('drive_temp_' + driveIdx, 'warning', `${label} runs hot under load`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
+    else if (col.stats.max >= 65) add('drive_temp:' + hwLabel, 'warning', `${label} runs hot under load`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
       "Consider checking or adding an M.2 heatsink, especially for sustained large file transfers.", col, 'Storage');
   }
   // Only counters that genuinely indicate a PCIe fault trigger the Warning/Serious
@@ -1057,18 +1134,35 @@ function detectIssues(file) {
   // a lower state when idle) rather than an actual error, so a nonzero, steady count
   // there is normal and not by itself a sign of a problem. It's surfaced separately
   // below at Info level instead of being lumped in with real fault counters.
-  const pcieFaultPatterns = [/^Correctable Error Count/i, /^Non-Fatal Error Count/i, /^Fatal Error Count/i, /^Bad DLLP Count/i, /^Bad TLP Count/i, /^LCRC Error Count/i, /^Replay Count/i];
-  let pcieTotal = 0; const pcieDetail = [];
-  for (const re of pcieFaultPatterns) for (const col of findAllNumeric(file, re)) if (col.stats.max > 0) { pcieTotal += col.stats.max; pcieDetail.push(`${stripUnit(col.name)}: ${col.stats.max}`); }
-  if (pcieTotal > 0) add('pcie_errors', pcieTotal > 50 ? 'serious' : 'warning', 'PCI Express link errors detected', `Non-zero PCIe error counters: ${pcieDetail.join(', ')}.`,
-    'A small number of correctable errors can happen occasionally, but a growing count usually points to a seating or signal-integrity issue: reseat the GPU (and any PCIe riser cable) firmly, try a different PCIe slot or riser cable, update chipset and GPU drivers, and confirm PCIe power connectors are fully seated. If errors keep climbing, they can eventually cause driver crashes or a reduced link speed.', null, 'PCIe');
-  for (const col of findAllNumeric(file, /^Recovery Count/i)) {
-    if (col.stats.max > 0) add('pcie_recovery', 'info', 'PCIe link recovery events observed', `Recovery Count: ${col.stats.max}.`,
-      "This usually just reflects the link changing speed or width — commonly triggered by ASPM (PCIe power management) dropping the link to a lower state when idle — rather than an actual error, so a steady nonzero count here is normal on most systems. If you want to rule ASPM out, you can disable it in BIOS or set your GPU's Windows power management mode to \"Prefer maximum performance.\" This is separate from PCI Express link errors above, which are the counters that actually indicate a fault.", col, 'PCIe');
+  //
+  // These counters are running totals, so a nonzero value can predate the log entirely.
+  // A counter that rises *during* the log is the real signal; one that was already
+  // nonzero but stayed flat is reported separately at a lower severity.
+  const pcieSeen = [], pcieRose = [];
+  let pcieRiseTotal = 0;
+  for (const re of PCIE_FAULT_PATTERNS) for (const col of findAllNumeric(file, re)) {
+    if (col.stats.max <= 0) continue;
+    const rise = counterIncrease(col);
+    pcieSeen.push(`${stripUnit(col.name)}: ${col.stats.max}`);
+    if (rise > 0) { pcieRiseTotal += rise; pcieRose.push(`${stripUnit(col.name)} +${rise}`); }
   }
+  const pcieFix = 'A small number of correctable errors can happen occasionally, but a growing count usually points to a seating or signal-integrity issue: reseat the GPU (and any PCIe riser cable) firmly, try a different PCIe slot or riser cable, update chipset and GPU drivers, and confirm PCIe power connectors are fully seated. If errors keep climbing, they can eventually cause driver crashes or a reduced link speed.';
+  if (pcieRiseTotal > 0) add('pcie_errors', pcieRiseTotal > 50 ? 'serious' : 'warning', 'PCI Express link errors increased during this log',
+    `Counters that went up while logging: ${pcieRose.join(', ')} (totals: ${pcieSeen.join(', ')}).`, pcieFix, null, 'PCIe');
+  else if (pcieSeen.length) add('pcie_errors', 'info', 'PCI Express error counters were already nonzero',
+    `${pcieSeen.join(', ')} — but none increased during this log, so these errors happened before logging started.`,
+    `Nothing went wrong during this session. If you want to know whether the link is healthy, compare these counters across a few logs: a count that keeps growing is worth acting on. ${pcieFix}`, null, 'PCIe');
+  for (const col of findAllNumeric(file, /^Recovery Count/i)) {
+    if (col.stats.max > 0) add('pcie_recovery', 'info', 'PCIe link recovery events observed', `Recovery Count: ${col.stats.max} (${counterIncrease(col)} during this log).`,
+      "This usually just reflects the link changing speed or width — commonly triggered by ASPM (PCIe power management) dropping the link to a lower state when idle — rather than an actual error, so a steady nonzero count here is normal on most systems. If you want to rule ASPM out, you can disable it in BIOS or set your GPU's Windows power management mode to \"Prefer maximum performance.\" Recovery events are separate from the PCIe error counters (correctable/non-fatal/fatal errors, bad TLP/DLLP, LCRC, replays, NAKs, receiver errors), which are the ones that actually indicate a fault.", col, 'PCIe');
+  }
+  const wheaFix = "WHEA events are logged by Windows when hardware reports a correctable or uncorrectable error. The most common cause is an unstable memory overclock — try resetting EXPO/XMP to a lower rated speed (or disabling it) and re-testing with MemTest86 or Karhu RAM Test. If it persists at JEDEC/stock memory speed, suspect the CPU's SoC/VDDIO voltages, the PCIe/GPU link, or a pending BIOS update.";
   for (const col of findAllNumeric(file, /whea/i)) {
-    if (col.stats.max > 0) add('whea', 'critical', 'Windows Hardware Error (WHEA) events logged', `${col.name} reached ${col.stats.max}.`,
-      "WHEA events are logged by Windows when hardware reports a correctable or uncorrectable error. The most common cause is an unstable memory overclock — try resetting EXPO/XMP to a lower rated speed (or disabling it) and re-testing with MemTest86 or Karhu RAM Test. If it persists at JEDEC/stock memory speed, suspect the CPU's SoC/VDDIO voltages, the PCIe/GPU link, or a pending BIOS update.", col, 'System');
+    if (col.stats.max <= 0) continue;
+    const rise = counterIncrease(col);
+    if (rise > 0) add('whea:' + sensorKey(col), 'critical', 'Windows Hardware Error (WHEA) events during this log', `${stripUnit(col.name)} rose by ${rise} while logging (now ${col.stats.max}).`, wheaFix, col, 'System');
+    else add('whea:' + sensorKey(col), 'warning', 'Windows Hardware Error (WHEA) events logged earlier', `${stripUnit(col.name)} was already at ${col.stats.max} when this log started and didn't increase during it.`,
+      `No new errors occurred during this session, but earlier ones are still worth understanding. ${wheaFix}`, col, 'System');
   }
   const memCfg = (typeof checkMemoryConfig === 'function') ? checkMemoryConfig(file) : null;
   if (memCfg && memCfg.mismatch) {
@@ -1085,7 +1179,7 @@ function detectIssues(file) {
   }
   const rpmCols = file.columns.filter(c => /\[RPM\]$/i.test(c.name) && c.isNumeric && c.stats && c.stats.max > 200);
   for (const col of rpmCols) {
-    if (col.stats.min === 0) add('fan_stall_' + col.index, 'warning', `${stripUnit(col.name)} reported 0 RPM at times`, `Ranged from 0 to ${col.stats.max.toFixed(0)} RPM.`,
+    if (col.stats.min === 0) add('fan_stall:' + sensorKey(col), 'warning', `${stripUnit(col.name)} reported 0 RPM at times`, `Ranged from 0 to ${col.stats.max.toFixed(0)} RPM.`,
       'This can be normal for a fan using a 0-RPM "silent" mode at low load, or it can indicate an intermittent connection or a failing fan. If this fan cools something that also ran hot in this log, check the cable seating and the fan curve in BIOS.', col, 'Motherboard');
   }
   // Gaming: capture-target sanity, stutter, and render-to-display pacing.
@@ -1098,7 +1192,7 @@ function detectIssues(file) {
       const frac = gaming.stutter.count / gaming.stutter.activeCount;
       if (frac > 0.08 || gaming.stutter.worstMs > 50) {
         add('frame_stutter', frac > 0.2 || gaming.stutter.worstMs > 100 ? 'serious' : 'warning', 'Frequent frame time spikes (stutter)',
-          `${gaming.stutter.count} of ${gaming.stutter.activeCount} active frames (${fmtPct(frac)}) ran past ${gaming.stutter.thresholdMs.toFixed(0)}ms — well above the session's typical ${gaming.stutter.medianMs.toFixed(1)}ms frame time. Worst frame: ${gaming.stutter.worstMs.toFixed(0)}ms.`,
+          `In ${gaming.stutter.count} of ${gaming.stutter.activeCount} active samples (${fmtPct(frac)}), the average frame time ran past ${gaming.stutter.thresholdMs.toFixed(0)}ms — well above the session's typical ${gaming.stutter.medianMs.toFixed(1)}ms. Worst sample: ${gaming.stutter.worstMs.toFixed(0)}ms.`,
           'Frame-time spikes like this are usually invisible in an average FPS number but very visible to a player. Common causes: background apps or overlays (Discord, browser, RGB software), an unstable memory overclock, CPU or GPU thermal throttling (check the Thermals tab for the same time window), an outdated GPU driver, or shader-compilation stutter in that specific game.', km.frame_time_avg, 'GPU');
       }
     }
@@ -1132,10 +1226,17 @@ function getPresentMonProcess(file) {
 }
 function isNonGameProcess(procName) { return !!procName && NON_GAME_PROCESSES.has(procName.toLowerCase()); }
 
-// Only frames faster than this (i.e. shorter frame time) count as "active" gameplay —
-// excludes idle desktop stalls where HWiNFO still logs a (huge) "frame" while nothing
-// is being rendered.
+// Each HWiNFO row is one polling interval, and its PresentMon columns are averages over
+// every frame rendered in that interval — so a row is a *sample*, not a frame. Everything
+// below works per sample. Only samples whose average frame time is under this cap count
+// as "active" gameplay — excludes idle desktop stalls where nothing is being rendered.
 const ACTIVE_FRAME_TIME_CAP_MS = 100; // ~10 FPS floor
+
+// Above this polling interval a single hitch is averaged in with hundreds of normal
+// frames and can't show up as a spike, so stutter detection is skipped rather than
+// reporting a misleadingly clean (or noisy) result.
+const STUTTER_MAX_SAMPLE_INTERVAL_MS = 2000;
+function stutterTooCoarse(file) { return file.sampleIntervalMs != null && file.sampleIntervalMs > STUTTER_MAX_SAMPLE_INTERVAL_MS; }
 
 function activeFrameIndices(file) {
   const km = resolveKeyMetrics(file);
@@ -1146,9 +1247,9 @@ function activeFrameIndices(file) {
   return { ft, idx };
 }
 
-// Compares per-frame GPU Busy vs CPU Busy time (both derived from the same PresentMon
-// capture) across active frames: whichever is closer to the full frame time is treated
-// as that frame's bottleneck. This is a simplified heuristic, not a cycle-accurate
+// Compares average GPU Busy vs CPU Busy time (both derived from the same PresentMon
+// capture) across active samples: whichever is closer to the full frame time is treated
+// as that sample's bottleneck. This is a simplified heuristic, not a cycle-accurate
 // profiler result, and is presented as such in the UI.
 function computeBottleneck(file) {
   const active = activeFrameIndices(file);
@@ -1167,8 +1268,10 @@ function computeBottleneck(file) {
   return { gpuBoundPct: gpuBound / counted, cpuBoundPct: cpuBound / counted, sampleCount: counted };
 }
 
-// Flags frames far slower than the session's own typical (active) frame time.
+// Flags samples whose average frame time is far above the session's own typical value.
+// Returns null when the log's polling interval is too coarse for this to mean anything.
 function detectStutters(file) {
+  if (stutterTooCoarse(file)) return null;
   const active = activeFrameIndices(file);
   if (!active || active.idx.length < 20) return null;
   const vals = active.idx.map(r => active.ft.series[r]).sort((a, b) => a - b);
@@ -1218,6 +1321,8 @@ function gamingSummary(file) {
     isGame: proc ? !isNonGameProcess(proc) : null,
     bottleneck: computeBottleneck(file),
     stutter: detectStutters(file),
+    sampleIntervalMs: file.sampleIntervalMs,
+    stutterTooCoarse: stutterTooCoarse(file),
     pacing: framePacingCheck(file),
   };
 }
@@ -1531,20 +1636,23 @@ function computeCompositeScores(files, profileKey) {
 
   const activeCats = Object.keys(SCORE_CATEGORIES).filter(c => categoryHasData[c]);
   if (!activeCats.length) return null;
-  const weightSum = activeCats.reduce((s, c) => s + profile[c], 0) || 1;
 
+  // Weights are renormalized per file over the categories that file actually has data
+  // for. A missing category must not count as 0 (= best) — otherwise a log with no
+  // frame data at all would get full marks on Performance.
   const perFile = files.map(f => {
     const breakdown = {};
-    let composite = 0;
+    let weighted = 0, usedWeight = 0;
     for (const c of activeCats) {
       const raw = categoryScores[c].has(f.id) ? categoryScores[c].get(f.id) : null; // 0 = best, 1 = worst
       breakdown[c] = raw == null ? null : Math.round((1 - raw) * 100);
-      if (raw != null) composite += (profile[c] / weightSum) * raw;
+      if (raw != null) { weighted += profile[c] * raw; usedWeight += profile[c]; }
     }
-    return { id: f.id, fileName: f.fileName, composite: Math.round((1 - composite) * 100), breakdown };
+    const composite = usedWeight > 0 ? Math.round((1 - weighted / usedWeight) * 100) : null;
+    return { id: f.id, fileName: f.fileName, composite, breakdown };
   });
-  perFile.sort((a, b) => b.composite - a.composite);
-  return { profile: profileKey, categories: activeCats, perFile, bestId: perFile[0] ? perFile[0].id : null };
+  perFile.sort((a, b) => (b.composite ?? -1) - (a.composite ?? -1));
+  return { profile: profileKey, categories: activeCats, perFile, bestId: perFile[0] && perFile[0].composite != null ? perFile[0].id : null };
 }
 
 // Backward-compatible wrapper for the older single-"best file" call sites (topbar
@@ -1559,7 +1667,9 @@ function topIssuesAcrossFiles(orderedFiles) {
   const byKey = new Map();
   orderedFiles.forEach((f, fileIdx) => {
     for (const issue of perFileIssues[fileIdx].issues) {
-      const key = issue.id.replace(/_\d+$/, '');
+      // Per-sensor ids (drive/VRM/fan) already name the sensor, so the same drive lines
+      // up across logs while two different drives stay two separate issues.
+      const key = issue.id;
       if (!byKey.has(key)) byKey.set(key, []);
       byKey.get(key).push(Object.assign({}, issue, { fileIdx, fileName: f.fileName }));
     }
@@ -1840,11 +1950,13 @@ const SECTIONS = [
 const FILE_COLORS = ['var(--file-1)', 'var(--file-2)', 'var(--file-3)', 'var(--file-4)'];
 
 // Edit these to point at your own repo / support link before publishing your fork.
+// A link still containing the YOUR-USERNAME placeholder is hidden rather than shown broken.
 const PROJECT_LINKS = {
-  github: 'https://github.com/YOUR-USERNAME/rig-diagnostic',
+  github: 'https://github.com/J0hnm4rt1n/rig-diagnostic',
   coffee: 'https://buymeacoffee.com/YOUR-USERNAME',
   version: '1.0.0-beta',
 };
+function isLinkConfigured(url) { return !!url && !url.includes('YOUR-USERNAME'); }
 
 // Testing methodology tips — not derived from a log, just hard-won advice for getting
 // a comparison you can actually trust. Shared between the Settings page (full list) and
@@ -2061,7 +2173,7 @@ function renderBannerLinks() {
   els.bannerLinks.innerHTML = `
     <button class="banner-link theme-toggle" title="Theme: ${STATE.theme} — click for ${THEME_NEXT_LABEL[STATE.theme]}">${icon(THEME_ICON[STATE.theme] || 'monitor')}</button>
     <a class="banner-link" href="${PROJECT_LINKS.github}" target="_blank" rel="noopener" title="View source on GitHub">${icon('github')}</a>
-    <a class="banner-link coffee-link" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener" title="Buy me a coffee">${icon('coffee')}<span>Buy me a coffee</span></a>
+    ${isLinkConfigured(PROJECT_LINKS.coffee) ? `<a class="banner-link coffee-link" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener" title="Buy me a coffee">${icon('coffee')}<span>Buy me a coffee</span></a>` : ''}
   `;
 }
 
@@ -2072,7 +2184,7 @@ function renderTopbar() {
     const isPriority = ordered[0] && ordered[0].id === f.id && STATE.files.length > 1;
     const isBest = best && best.id === f.id;
     return `
-    <div class="file-chip ${isPriority ? 'priority' : ''}" data-id="${f.id}" title="${escapeHtml(f.fileName)}${f.label ? ' — labeled "' + f.label + '"' : ''}${isBest ? ' — best overall run (lowest temps, best frame performance among loaded logs)' : ''}">
+    <div class="file-chip ${isPriority ? 'priority' : ''}" data-id="${f.id}" title="${escapeHtml(f.fileName)}${f.label ? ' — labeled "' + escapeHtml(f.label) + '"' : ''}${isBest ? ' — best overall run (lowest temps, best frame performance among loaded logs)' : ''}">
       ${isBest ? `<span class="best-star">${icon('star')}</span>` : ''}
       <span class="dot" style="background:${f.color}"></span>
       <span class="fname">${escapeHtml(displayName(f))}</span>
@@ -2219,7 +2331,8 @@ function groupDriveColumns(file) {
   }
   return order.map(label => {
     const d = byLabel.get(label);
-    const clean = label.replace(/^drive:\s*/i, '').replace(/^s\.m\.a\.r\.t\.?:\s*/i, '');
+    const clean = driveDisplayName(label);
+    d.label = clean; // full label without the serial, used for the table cell tooltip
     d.shortLabel = clean.length > 42 ? clean.slice(0, 40) + '…' : clean;
     return d;
   });
@@ -2252,6 +2365,7 @@ function buildHeadroomText(file) {
   if (gpuSpec) {
     lines.push(`${gpuSpec.name}:`);
     if (km.gpu_temp) lines.push(`  Peak temp: ${km.gpu_temp.stats.max.toFixed(1)}C (~${gpuSpec.coreThrottleC}C typical throttle point)`);
+    if (km.gpu_hotspot) lines.push(`  Peak hot spot: ${km.gpu_hotspot.stats.max.toFixed(1)}C (~${gpuSpec.hotspotThrottleC || DEFAULT_GPU_HOTSPOT_LIMIT_C}C ${gpuSpec.hotspotThrottleC ? 'typical throttle point' : 'warning level'})`);
     if (km.gpu_power) lines.push(`  Peak power: ${km.gpu_power.stats.max.toFixed(0)}W (~${gpuSpec.tbpW}W reference board power)`);
   }
   return lines.join('\n');
@@ -2310,11 +2424,13 @@ function buildGamingText(ordered) {
   lines.push(`Capture target: ${gs.process}${gs.isGame ? '' : ' (not a game)'}`);
   if (gs.bottleneck) {
     const gpuPct = Math.round(gs.bottleneck.gpuBoundPct * 100), cpuPct = 100 - gpuPct;
-    lines.push(`CPU/GPU bottleneck: GPU-bound ${gpuPct}%, CPU-bound ${cpuPct}% (based on ${gs.bottleneck.sampleCount.toLocaleString()} active frames)`);
+    lines.push(`CPU/GPU bottleneck: GPU-bound ${gpuPct}%, CPU-bound ${cpuPct}% (based on ${gs.bottleneck.sampleCount.toLocaleString()} active samples)`);
   }
   if (gs.stutter && gs.stutter.activeCount >= 20) {
     const s = gs.stutter;
-    lines.push(`Frame pacing: ${s.count} stutter events of ${s.activeCount} active frames; typical frame time ${s.medianMs.toFixed(1)}ms; worst spike ${s.worstMs.toFixed(0)}ms`);
+    lines.push(`Frame pacing: ${s.count} of ${s.activeCount} active samples spiked; typical frame time ${s.medianMs.toFixed(1)}ms; worst sample ${s.worstMs.toFixed(0)}ms`);
+  } else if (gs.stutterTooCoarse) {
+    lines.push(`Frame pacing: not assessed — log polled every ${fmtSampleInterval(gs.sampleIntervalMs)}, too coarse to show frame-time spikes`);
   }
   if (gs.pacing) {
     lines.push(`Presented vs. displayed: ${gs.pacing.presentedAvg.toFixed(0)} FPS presented, ${gs.pacing.displayedAvg.toFixed(0)} FPS displayed (${fmtPct(gs.pacing.gapPct)} ${gs.pacing.gapPct >= 0 ? 'lower' : 'higher'})`);
@@ -2444,8 +2560,14 @@ function specHeadroomHtml(file) {
   if (gpuSpec) {
     let b = `<div style="flex:1;min-width:240px;"><div style="font-weight:600;font-size:13.5px;margin-bottom:8px;">${escapeHtml(gpuSpec.name)}</div>`;
     if (km.gpu_temp) { const p = km.gpu_temp.stats.max / gpuSpec.coreThrottleC; b += headroomBarHtml('Peak temp vs. throttle point', km.gpu_temp.stats.max, gpuSpec.coreThrottleC, '°C', p > 0.95 ? 'critical' : p > 0.88 ? 'warning' : 'good'); }
+    if (km.gpu_hotspot) {
+      const limit = gpuSpec.hotspotThrottleC || DEFAULT_GPU_HOTSPOT_LIMIT_C;
+      const p = km.gpu_hotspot.stats.max / limit;
+      b += headroomBarHtml(gpuSpec.hotspotThrottleC ? 'Peak hot spot vs. throttle point' : 'Peak hot spot vs. warning level', km.gpu_hotspot.stats.max, limit, '°C', p > 0.95 ? 'critical' : p > 0.88 ? 'warning' : 'good');
+    }
     if (km.gpu_power) { const p = km.gpu_power.stats.max / gpuSpec.tbpW; b += headroomBarHtml('Peak power vs. reference board power', km.gpu_power.stats.max, gpuSpec.tbpW, 'W', p > 1.1 ? 'accent' : 'good'); }
-    if (gpuSpec.note) b += `<div class="footnote">${escapeHtml(gpuSpec.note)}</div>`;
+    const gpuNote = gpuSpecNoteFor(gpuSpec, !!km.gpu_hotspot);
+    if (gpuNote) b += `<div class="footnote">${escapeHtml(gpuNote)}</div>`;
     b += `</div>`;
     blocks.push(b);
   }
@@ -2634,17 +2756,21 @@ function bottleneckPanelHtml(gs) {
       <span class="legend-item"><span class="legend-swatch" style="background:var(--file-2)"></span>CPU-bound ${cpuPct}%</span>
     </div>
     <div class="issue-detail">${verdict}</div>
-    <div class="footnote" style="margin-top:6px;">Based on ${sampleCount.toLocaleString()} active frames, comparing per-frame GPU Busy vs. CPU Busy time. A simplified heuristic, not a cycle-accurate profile.</div>`;
+    <div class="footnote" style="margin-top:6px;">Based on ${sampleCount.toLocaleString()} active log samples${gs.sampleIntervalMs ? ` (one every ${fmtSampleInterval(gs.sampleIntervalMs)})` : ''}, comparing average GPU Busy vs. CPU Busy time in each. A simplified heuristic, not a cycle-accurate profile.</div>`;
 }
 
+function fmtSampleInterval(ms) { return ms >= 1000 ? `${+(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`; }
+
 function stutterPanelHtml(gs) {
+  if (gs.stutterTooCoarse) return `<div class="issue-detail">Frame pacing can't be assessed from this log. It was recorded at one sample every ${fmtSampleInterval(gs.sampleIntervalMs)}, and each sample averages every frame rendered in that time, so short stutters get averaged away.</div>
+    <div class="footnote" style="margin-top:6px;">To see frame-time spikes, set HWiNFO's sensor polling period to 1000 ms or less before logging.</div>`;
   if (!gs.stutter || gs.stutter.activeCount < 20) return '<div class="footnote">Not enough active-gameplay samples to assess frame pacing.</div>';
   const s = gs.stutter;
   const frac = s.count / s.activeCount;
   const tone = frac > 0.2 || s.worstMs > 100 ? 'critical' : frac > 0.08 || s.worstMs > 50 ? 'warning' : 'good';
   return `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
       <div class="tile" style="flex:1;min-width:140px;">
-        <div class="tile-label">Stutter events</div>
+        <div class="tile-label">Samples with spikes</div>
         <div class="tile-value-row"><span class="tile-value tnum" style="color:var(--${tone});">${s.count}</span><span class="tile-unit">of ${s.activeCount}</span></div>
       </div>
       <div class="tile" style="flex:1;min-width:140px;">
@@ -2657,7 +2783,7 @@ function stutterPanelHtml(gs) {
         ${s.worstElapsedMs != null ? `<div class="footnote">at ${fmtElapsed(s.worstElapsedMs)} elapsed</div>` : ''}
       </div>
     </div>
-    <div class="footnote" style="margin-top:10px;">A frame counts as a stutter here if it took longer than ${s.thresholdMs.toFixed(0)}ms — roughly double this session's own typical frame time.</div>`;
+    <div class="footnote" style="margin-top:10px;">Each log sample${gs.sampleIntervalMs ? ` (one every ${fmtSampleInterval(gs.sampleIntervalMs)})` : ''} holds the average frame time over that interval. A sample counts as a spike if that average exceeded ${s.thresholdMs.toFixed(0)}ms — roughly double this session's typical frame time. A single hitched frame barely moves an average, so this catches sustained slowdowns more than one-frame stutters.</div>`;
 }
 
 function renderGaming(container, ordered) {
@@ -2696,7 +2822,7 @@ function renderGaming(container, ordered) {
     const panel = document.createElement('div');
     panel.className = 'panel';
     panel.innerHTML = `<div class="panel-head"><h3>Across loaded logs</h3></div>
-      <div class="table-scroll"><table class="data-table"><thead><tr><th>Log</th><th>Capture target</th><th>GPU-bound</th><th>Stutter events</th><th>Worst spike</th></tr></thead><tbody>
+      <div class="table-scroll"><table class="data-table"><thead><tr><th>Log</th><th>Capture target</th><th>GPU-bound</th><th>Samples with spikes</th><th>Worst sample</th></tr></thead><tbody>
       ${rows.map(({ f, gs: g }) => `<tr>
         <td>${escapeHtml(displayName(f))}</td>
         <td>${g.process ? escapeHtml(g.process) + (g.isGame ? '' : ' (not a game)') : '—'}</td>
@@ -2772,7 +2898,7 @@ function renderNetwork(container, ordered) {
   COPY_REGISTRY['network-page'] = buildNetworkText(ordered);
   container.innerHTML = `<div class="page-head"><div><h1>Network & PCIe</h1><p>Link throughput plus PCI Express link-error counters, which are a good early signal of a seating or signal-integrity problem.</p></div>${copyButtonHtml('network-page', 'network and PCIe')}</div>
   <div id="net-charts"></div>
-  <div class="panel" id="pcie-panel"><div class="panel-head"><h3>PCI Express error counters</h3><span class="sub">most recent log — non-zero is worth investigating</span></div><div class="table-scroll" id="pcie-table"></div></div>`;
+  <div class="panel" id="pcie-panel"><div class="panel-head"><h3>PCI Express error counters</h3><span class="sub">most recent log — these are running totals; an error counter that rises during the log is worth investigating</span></div><div class="table-scroll" id="pcie-table"></div></div>`;
 
   const newest = ordered[0];
   const dlCols = findAllNumeric(newest, /^Current DL rate/i);
@@ -2801,12 +2927,17 @@ function renderNetwork(container, ordered) {
     if (idleCount) { const note = document.createElement('div'); note.className = 'footnote'; note.style.marginTop = '10px'; note.textContent = `${idleCount} additional network interface${idleCount > 1 ? 's' : ''} carried no traffic during this log and ${idleCount > 1 ? 'are' : 'is'} hidden.`; netChartsEl.appendChild(note); }
   } else netChartsEl.innerHTML = '<div class="footnote">No network throughput sensors were found in the loaded log(s).</div>';
 
-  const pcieErrPatterns = [/^Correctable Error Count/i, /^Non-Fatal Error Count/i, /^Fatal Error Count/i, /^Bad DLLP Count/i, /^Bad TLP Count/i, /^LCRC Error Count/i, /^Replay Count/i, /^Recovery Count/i, /^Receiver Errors/i, /^NAKs Sent Count/i, /^NAKs Received Count/i];
   const pcieTable = container.querySelector('#pcie-table');
   let rows = [];
-  for (const re of pcieErrPatterns) for (const col of findAllNumeric(newest, re)) rows.push([stripUnit(col.name), col.stats.max]);
+  for (const re of PCIE_FAULT_PATTERNS) for (const col of findAllNumeric(newest, re)) rows.push({ name: stripUnit(col.name), col, benign: false });
+  for (const col of findAllNumeric(newest, /^Recovery Count/i)) rows.push({ name: stripUnit(col.name), col, benign: true });
+  const changeTag = (r) => {
+    const rise = counterIncrease(r.col);
+    if (rise <= 0) return '<span class="delta-tag better">0</span>';
+    return r.benign ? `<span class="delta-tag">+${rise}</span>` : `<span class="delta-tag worse">+${rise}</span>`;
+  };
   if (!rows.length) pcieTable.innerHTML = '<div class="footnote" style="padding:10px 0;">No PCIe error counters were found in this log.</div>';
-  else pcieTable.innerHTML = `<table class="data-table"><thead><tr><th>Counter</th><th>Max observed</th></tr></thead><tbody>${rows.map(([n, v]) => `<tr><td>${n}</td><td class="mono tnum">${v > 0 ? `<span class="delta-tag worse">${v}</span>` : '<span class="delta-tag better">0</span>'}</td></tr>`).join('')}</tbody></table>`;
+  else pcieTable.innerHTML = `<table class="data-table"><thead><tr><th>Counter</th><th>At start</th><th>At end</th><th>Change during log</th></tr></thead><tbody>${rows.map(r => `<tr><td>${escapeHtml(r.name)}${r.benign ? ' <span class="footnote">(usually harmless — link power-state changes)</span>' : ''}</td><td class="mono tnum">${r.col.stats.min}</td><td class="mono tnum">${r.col.stats.max}</td><td class="mono tnum">${changeTag(r)}</td></tr>`).join('')}</tbody></table>`;
 }
 
 // Small colored ↑/↓/→ glyph shown between two adjacent value columns in the Metric
@@ -2936,7 +3067,7 @@ function renderCompare(container, ordered) {
       }).join('');
       return `<div class="verdict-card ${isBest ? 'is-best' : ''}">
         <div class="vc-head">${isBest ? `<span class="best-star">${icon('star')}</span>` : ''}<span>${escapeHtml(displayName(f).slice(0, 22))}</span></div>
-        <div class="vc-score ${scoreTone(s.composite)}">${s.composite}</div>
+        <div class="vc-score ${scoreTone(s.composite)}">${s.composite == null ? '—' : s.composite}</div>
         ${rows}
       </div>`;
     }).join('');
@@ -3146,8 +3277,9 @@ function buildReportText(ordered) {
   if (gs && gs.process) {
     lines.push('GAMING (most recent log)');
     lines.push(`Capture target: ${gs.process}${gs.isGame ? '' : ' (not a game — desktop/system capture)'}`);
-    if (gs.bottleneck) lines.push(`Bottleneck: GPU-bound ${Math.round(gs.bottleneck.gpuBoundPct * 100)}% / CPU-bound ${Math.round((1 - gs.bottleneck.gpuBoundPct) * 100)}% of active frames`);
-    if (gs.stutter) lines.push(`Stutters: ${gs.stutter.count} of ${gs.stutter.activeCount} active frames exceeded ${gs.stutter.thresholdMs.toFixed(0)}ms (worst ${gs.stutter.worstMs.toFixed(0)}ms)`);
+    if (gs.bottleneck) lines.push(`Bottleneck: GPU-bound ${Math.round(gs.bottleneck.gpuBoundPct * 100)}% / CPU-bound ${Math.round((1 - gs.bottleneck.gpuBoundPct) * 100)}% of active samples`);
+    if (gs.stutter) lines.push(`Frame-time spikes: ${gs.stutter.count} of ${gs.stutter.activeCount} active samples averaged over ${gs.stutter.thresholdMs.toFixed(0)}ms (worst ${gs.stutter.worstMs.toFixed(0)}ms)`);
+    else if (gs.stutterTooCoarse) lines.push(`Frame pacing: not assessed — log polled every ${fmtSampleInterval(gs.sampleIntervalMs)}, too coarse to show frame-time spikes`);
     if (gs.pacing) lines.push(`Presented ${gs.pacing.presentedAvg.toFixed(0)} FPS vs. displayed ${gs.pacing.displayedAvg.toFixed(0)} FPS (${fmtPct(gs.pacing.gapPct)} gap)`);
     lines.push('');
   }
@@ -3273,7 +3405,7 @@ function renderSettings(container) {
       <p class="footnote" style="margin:0 0 10px;">Free and open source, licensed under the MIT License. Everything runs client-side in your browser — no server, no accounts, no telemetry, and your log files are never uploaded anywhere.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <a class="btn ghost" href="${PROJECT_LINKS.github}" target="_blank" rel="noopener">${icon('github')}<span>Source on GitHub</span></a>
-        <a class="btn ghost" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener">${icon('coffee')}<span>Buy me a coffee</span></a>
+        ${isLinkConfigured(PROJECT_LINKS.coffee) ? `<a class="btn ghost" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener">${icon('coffee')}<span>Buy me a coffee</span></a>` : ''}
       </div>
     </div>
   `;
@@ -3312,3 +3444,5 @@ initShell();
 render();
 
 </script>
+</body>
+</html>

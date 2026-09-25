@@ -11,6 +11,6 @@ ${parts.join('\n\n')}
 ${mainJs}
 </script>`;
 
-const full = shell + '\n' + script + '\n';
+const full = shell + '\n' + script + '\n</body>\n</html>\n';
 fs.writeFileSync(path + '/index.html', full, 'utf8');
 console.log('wrote index.html,', Buffer.byteLength(full), 'bytes');

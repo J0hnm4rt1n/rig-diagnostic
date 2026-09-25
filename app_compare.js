@@ -257,20 +257,23 @@ function computeCompositeScores(files, profileKey) {
 
   const activeCats = Object.keys(SCORE_CATEGORIES).filter(c => categoryHasData[c]);
   if (!activeCats.length) return null;
-  const weightSum = activeCats.reduce((s, c) => s + profile[c], 0) || 1;
 
+  // Weights are renormalized per file over the categories that file actually has data
+  // for. A missing category must not count as 0 (= best) — otherwise a log with no
+  // frame data at all would get full marks on Performance.
   const perFile = files.map(f => {
     const breakdown = {};
-    let composite = 0;
+    let weighted = 0, usedWeight = 0;
     for (const c of activeCats) {
       const raw = categoryScores[c].has(f.id) ? categoryScores[c].get(f.id) : null; // 0 = best, 1 = worst
       breakdown[c] = raw == null ? null : Math.round((1 - raw) * 100);
-      if (raw != null) composite += (profile[c] / weightSum) * raw;
+      if (raw != null) { weighted += profile[c] * raw; usedWeight += profile[c]; }
     }
-    return { id: f.id, fileName: f.fileName, composite: Math.round((1 - composite) * 100), breakdown };
+    const composite = usedWeight > 0 ? Math.round((1 - weighted / usedWeight) * 100) : null;
+    return { id: f.id, fileName: f.fileName, composite, breakdown };
   });
-  perFile.sort((a, b) => b.composite - a.composite);
-  return { profile: profileKey, categories: activeCats, perFile, bestId: perFile[0] ? perFile[0].id : null };
+  perFile.sort((a, b) => (b.composite ?? -1) - (a.composite ?? -1));
+  return { profile: profileKey, categories: activeCats, perFile, bestId: perFile[0] && perFile[0].composite != null ? perFile[0].id : null };
 }
 
 // Backward-compatible wrapper for the older single-"best file" call sites (topbar
@@ -285,7 +288,9 @@ function topIssuesAcrossFiles(orderedFiles) {
   const byKey = new Map();
   orderedFiles.forEach((f, fileIdx) => {
     for (const issue of perFileIssues[fileIdx].issues) {
-      const key = issue.id.replace(/_\d+$/, '');
+      // Per-sensor ids (drive/VRM/fan) already name the sensor, so the same drive lines
+      // up across logs while two different drives stay two separate issues.
+      const key = issue.id;
       if (!byKey.has(key)) byKey.set(key, []);
       byKey.get(key).push(Object.assign({}, issue, { fileIdx, fileName: f.fileName }));
     }

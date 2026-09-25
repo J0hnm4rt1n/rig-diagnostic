@@ -76,6 +76,12 @@ function resolveBoolMetrics(file) {
 }
 function findAllNumeric(file, re) { return file.columns.filter(c => re.test(c.name) && c.isNumeric && c.stats && c.stats.count > 0); }
 
+// PCIe counters that indicate an actual link fault (Recovery Count is deliberately not
+// one of them — see detectIssues). Shared with the Network & PCIe table.
+const PCIE_FAULT_PATTERNS = [/^Correctable Error Count/i, /^Non-Fatal Error Count/i, /^Fatal Error Count/i, /^Bad DLLP Count/i, /^Bad TLP Count/i, /^LCRC Error Count/i, /^Replay Count/i, /^Receiver Errors/i, /^NAKs Sent Count/i, /^NAKs Received Count/i];
+// How much a running-total counter went up within this log.
+function counterIncrease(col) { return col.stats.max - col.stats.min; }
+
 const SEVERITY_RANK = { critical: 4, serious: 3, warning: 2, info: 1 };
 function pctTrue(cols) { let t = 0, tot = 0; for (const c of cols) { t += c.boolStats.trueCount; tot += c.boolStats.total; } return tot ? t / tot : 0; }
 function fmtPct(x) { return `${Math.round(x * 100)}%`; }
@@ -88,6 +94,14 @@ function fmtDur(ms) {
   return `${h}h ${rm}m`;
 }
 function stripUnit(name) { return name.replace(/\s*\[.*\]$/, ''); }
+// Identifies the same physical sensor across logs (column indexes shift between logs,
+// and two devices can share a column name), so per-sensor issue ids stay distinct
+// within a log and still line up between logs.
+function sensorKey(col) { return `${col.hwLabel || ''}|${col.name}`; }
+function driveDisplayName(hwLabel) {
+  const clean = stripDriveSerial((hwLabel || '').replace(/^drive:\s*/i, '').replace(/^s\.m\.a\.r\.t\.?:\s*/i, ''));
+  return clean || 'Drive';
+}
 
 function detectIssues(file) {
   const km = resolveKeyMetrics(file);
@@ -133,9 +147,9 @@ function detectIssues(file) {
   const vrmCols = findAllNumeric(file, /VRM.*Temperature|VDDCR_VDD VRM|VDDCR_SOC VRM/i);
   for (const col of vrmCols) {
     const s = col.stats;
-    if (s.max >= 100) add('vrm_temp_' + col.index, 'critical', `${stripUnit(col.name)} is very hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
+    if (s.max >= 100) add('vrm_temp:' + sensorKey(col), 'critical', `${stripUnit(col.name)} is very hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
       'Sustained high VRM temperatures shorten regulator lifespan and can trigger unexpected shutdowns. Improve airflow directly over the VRM heatsink (a case fan or an AIO pump-mounted fan aimed at the socket area helps a lot on compact boards), and confirm the VRM heatsink is properly seated with intact thermal pads.', col, 'Motherboard');
-    else if (s.max >= 90) add('vrm_temp_' + col.index, 'warning', `${stripUnit(col.name)} runs hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
+    else if (s.max >= 90) add('vrm_temp:' + sensorKey(col), 'warning', `${stripUnit(col.name)} runs hot`, `Peaked at ${s.max.toFixed(1)}°C.`,
       'Keep an eye on this, especially in a compact case. A small fan directed at the VRM heatsink area is a cheap fix.', col, 'Motherboard');
   }
   if (km.gpu_temp) {
@@ -146,7 +160,8 @@ function detectIssues(file) {
     const throttleT = gpuSpec ? gpuSpec.coreThrottleC : 90;
     const seriousT = throttleT - 2, warningT = throttleT - 10;
     const specNote = gpuSpec ? ` (identified as a ${gpuSpec.name})` : '';
-    if (s.max >= seriousT) add('gpu_temp', 'serious', 'GPU core temperature is high', `Peaked at ${s.max.toFixed(1)}°C${specNote}.${gpuSpec && gpuSpec.note ? ' ' + gpuSpec.note : ''}`,
+    const gpuNote = gpuSpecNoteFor(gpuSpec, !!km.gpu_hotspot);
+    if (s.max >= seriousT) add('gpu_temp', 'serious', 'GPU core temperature is high', `Peaked at ${s.max.toFixed(1)}°C${specNote}.${gpuNote ? ' ' + gpuNote : ''}`,
       "Check that the case has adequate intake for the card's fans, that the fan curve isn't too passive at high load, and that the card is seated flat. Consider a more aggressive fan curve or improved case airflow.", km.gpu_temp, 'GPU');
     else if (s.max >= warningT) add('gpu_temp', 'warning', 'GPU runs warm under load', `Peaked at ${s.max.toFixed(1)}°C${specNote}.`,
       'Likely fine for most cards, but check case airflow and fan curve if you want more headroom.', km.gpu_temp, 'GPU');
@@ -158,7 +173,7 @@ function detectIssues(file) {
   }
   if (km.gpu_hotspot) {
     const s = km.gpu_hotspot.stats;
-    const hsThrottle = (gpuSpec && gpuSpec.hotspotThrottleC) ? gpuSpec.hotspotThrottleC : 100;
+    const hsThrottle = (gpuSpec && gpuSpec.hotspotThrottleC) ? gpuSpec.hotspotThrottleC : DEFAULT_GPU_HOTSPOT_LIMIT_C;
     if (s.max >= hsThrottle) add('gpu_hotspot', 'critical', 'GPU hot-spot temperature is very high', `Peaked at ${s.max.toFixed(1)}°C${gpuSpec ? ` (reference throttle point for a ${gpuSpec.name} is around ${hsThrottle}°C)` : ''}.`,
       'A hot spot this high, especially alongside a much cooler core/edge reading, often points to thermal paste or pad degradation rather than a genuinely underpowered cooler. Consider a repaste/repad, and if this is a recent purchase, it may be worth raising with the vendor.', km.gpu_hotspot, 'GPU');
     else if (s.max >= 90) add('gpu_hotspot', 'warning', 'GPU hot-spot temperature runs high', `Peaked at ${s.max.toFixed(1)}°C${km.gpu_temp ? ` vs. ${km.gpu_temp.stats.max.toFixed(1)}°C core edge` : ''}.`,
@@ -186,9 +201,10 @@ function detectIssues(file) {
   const remainingLifeCols = findAllNumeric(file, /Drive Remaining Life/i);
   for (const col of remainingLifeCols) {
     const s = col.stats;
-    if (s.min <= 70) add('drive_life_' + col.index, 'critical', 'Drive SMART health critically low', `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
+    const name = driveDisplayName(col.hwLabel);
+    if (s.min <= 70) add('drive_life:' + sensorKey(col), 'critical', `${name}: SMART health critically low`, `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
       "Back up this drive's data now and plan to replace it — SMART-reported remaining life this low means the drive's estimated endurance is largely used up.", col, 'Storage');
-    else if (s.min <= 90) add('drive_life_' + col.index, 'warning', 'Drive SMART health degrading', `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
+    else if (s.min <= 90) add('drive_life:' + sensorKey(col), 'warning', `${name}: SMART health degrading`, `Remaining life reported as low as ${s.min.toFixed(0)}%.`,
       'Not urgent, but worth including this drive in your backup rotation and watching the trend over time.', col, 'Storage');
   }
   if (bm.drive_warning && pctTrue(bm.drive_warning) > 0) add('drive_warning', 'critical', 'Drive reported a SMART warning', 'One or more drives flagged a SMART warning condition during this session.',
@@ -202,13 +218,11 @@ function detectIssues(file) {
     const cur = tempByDrive.get(col.hwLabel);
     if (!cur || col.stats.max > cur.stats.max) tempByDrive.set(col.hwLabel, col);
   }
-  let driveIdx = 0;
   for (const [hwLabel, col] of tempByDrive.entries()) {
-    driveIdx++;
-    const label = hwLabel.replace(/^drive:\s*/i, '').replace(/^s\.m\.a\.r\.t\.?:\s*/i, '');
-    if (col.stats.max >= 75) add('drive_temp_' + driveIdx, 'serious', `${label} is running very hot`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
+    const label = driveDisplayName(hwLabel);
+    if (col.stats.max >= 75) add('drive_temp:' + hwLabel, 'serious', `${label} is running very hot`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
       'NVMe SSDs throttle (and can wear out faster) when consistently this hot. Add a heatsink or improve airflow across the M.2 slot.', col, 'Storage');
-    else if (col.stats.max >= 65) add('drive_temp_' + driveIdx, 'warning', `${label} runs hot under load`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
+    else if (col.stats.max >= 65) add('drive_temp:' + hwLabel, 'warning', `${label} runs hot under load`, `Peaked at ${col.stats.max.toFixed(0)}°C.`,
       "Consider checking or adding an M.2 heatsink, especially for sustained large file transfers.", col, 'Storage');
   }
   // Only counters that genuinely indicate a PCIe fault trigger the Warning/Serious
@@ -218,18 +232,35 @@ function detectIssues(file) {
   // a lower state when idle) rather than an actual error, so a nonzero, steady count
   // there is normal and not by itself a sign of a problem. It's surfaced separately
   // below at Info level instead of being lumped in with real fault counters.
-  const pcieFaultPatterns = [/^Correctable Error Count/i, /^Non-Fatal Error Count/i, /^Fatal Error Count/i, /^Bad DLLP Count/i, /^Bad TLP Count/i, /^LCRC Error Count/i, /^Replay Count/i];
-  let pcieTotal = 0; const pcieDetail = [];
-  for (const re of pcieFaultPatterns) for (const col of findAllNumeric(file, re)) if (col.stats.max > 0) { pcieTotal += col.stats.max; pcieDetail.push(`${stripUnit(col.name)}: ${col.stats.max}`); }
-  if (pcieTotal > 0) add('pcie_errors', pcieTotal > 50 ? 'serious' : 'warning', 'PCI Express link errors detected', `Non-zero PCIe error counters: ${pcieDetail.join(', ')}.`,
-    'A small number of correctable errors can happen occasionally, but a growing count usually points to a seating or signal-integrity issue: reseat the GPU (and any PCIe riser cable) firmly, try a different PCIe slot or riser cable, update chipset and GPU drivers, and confirm PCIe power connectors are fully seated. If errors keep climbing, they can eventually cause driver crashes or a reduced link speed.', null, 'PCIe');
-  for (const col of findAllNumeric(file, /^Recovery Count/i)) {
-    if (col.stats.max > 0) add('pcie_recovery', 'info', 'PCIe link recovery events observed', `Recovery Count: ${col.stats.max}.`,
-      "This usually just reflects the link changing speed or width — commonly triggered by ASPM (PCIe power management) dropping the link to a lower state when idle — rather than an actual error, so a steady nonzero count here is normal on most systems. If you want to rule ASPM out, you can disable it in BIOS or set your GPU's Windows power management mode to \"Prefer maximum performance.\" This is separate from PCI Express link errors above, which are the counters that actually indicate a fault.", col, 'PCIe');
+  //
+  // These counters are running totals, so a nonzero value can predate the log entirely.
+  // A counter that rises *during* the log is the real signal; one that was already
+  // nonzero but stayed flat is reported separately at a lower severity.
+  const pcieSeen = [], pcieRose = [];
+  let pcieRiseTotal = 0;
+  for (const re of PCIE_FAULT_PATTERNS) for (const col of findAllNumeric(file, re)) {
+    if (col.stats.max <= 0) continue;
+    const rise = counterIncrease(col);
+    pcieSeen.push(`${stripUnit(col.name)}: ${col.stats.max}`);
+    if (rise > 0) { pcieRiseTotal += rise; pcieRose.push(`${stripUnit(col.name)} +${rise}`); }
   }
+  const pcieFix = 'A small number of correctable errors can happen occasionally, but a growing count usually points to a seating or signal-integrity issue: reseat the GPU (and any PCIe riser cable) firmly, try a different PCIe slot or riser cable, update chipset and GPU drivers, and confirm PCIe power connectors are fully seated. If errors keep climbing, they can eventually cause driver crashes or a reduced link speed.';
+  if (pcieRiseTotal > 0) add('pcie_errors', pcieRiseTotal > 50 ? 'serious' : 'warning', 'PCI Express link errors increased during this log',
+    `Counters that went up while logging: ${pcieRose.join(', ')} (totals: ${pcieSeen.join(', ')}).`, pcieFix, null, 'PCIe');
+  else if (pcieSeen.length) add('pcie_errors', 'info', 'PCI Express error counters were already nonzero',
+    `${pcieSeen.join(', ')} — but none increased during this log, so these errors happened before logging started.`,
+    `Nothing went wrong during this session. If you want to know whether the link is healthy, compare these counters across a few logs: a count that keeps growing is worth acting on. ${pcieFix}`, null, 'PCIe');
+  for (const col of findAllNumeric(file, /^Recovery Count/i)) {
+    if (col.stats.max > 0) add('pcie_recovery', 'info', 'PCIe link recovery events observed', `Recovery Count: ${col.stats.max} (${counterIncrease(col)} during this log).`,
+      "This usually just reflects the link changing speed or width — commonly triggered by ASPM (PCIe power management) dropping the link to a lower state when idle — rather than an actual error, so a steady nonzero count here is normal on most systems. If you want to rule ASPM out, you can disable it in BIOS or set your GPU's Windows power management mode to \"Prefer maximum performance.\" Recovery events are separate from the PCIe error counters (correctable/non-fatal/fatal errors, bad TLP/DLLP, LCRC, replays, NAKs, receiver errors), which are the ones that actually indicate a fault.", col, 'PCIe');
+  }
+  const wheaFix = "WHEA events are logged by Windows when hardware reports a correctable or uncorrectable error. The most common cause is an unstable memory overclock — try resetting EXPO/XMP to a lower rated speed (or disabling it) and re-testing with MemTest86 or Karhu RAM Test. If it persists at JEDEC/stock memory speed, suspect the CPU's SoC/VDDIO voltages, the PCIe/GPU link, or a pending BIOS update.";
   for (const col of findAllNumeric(file, /whea/i)) {
-    if (col.stats.max > 0) add('whea', 'critical', 'Windows Hardware Error (WHEA) events logged', `${col.name} reached ${col.stats.max}.`,
-      "WHEA events are logged by Windows when hardware reports a correctable or uncorrectable error. The most common cause is an unstable memory overclock — try resetting EXPO/XMP to a lower rated speed (or disabling it) and re-testing with MemTest86 or Karhu RAM Test. If it persists at JEDEC/stock memory speed, suspect the CPU's SoC/VDDIO voltages, the PCIe/GPU link, or a pending BIOS update.", col, 'System');
+    if (col.stats.max <= 0) continue;
+    const rise = counterIncrease(col);
+    if (rise > 0) add('whea:' + sensorKey(col), 'critical', 'Windows Hardware Error (WHEA) events during this log', `${stripUnit(col.name)} rose by ${rise} while logging (now ${col.stats.max}).`, wheaFix, col, 'System');
+    else add('whea:' + sensorKey(col), 'warning', 'Windows Hardware Error (WHEA) events logged earlier', `${stripUnit(col.name)} was already at ${col.stats.max} when this log started and didn't increase during it.`,
+      `No new errors occurred during this session, but earlier ones are still worth understanding. ${wheaFix}`, col, 'System');
   }
   const memCfg = (typeof checkMemoryConfig === 'function') ? checkMemoryConfig(file) : null;
   if (memCfg && memCfg.mismatch) {
@@ -246,7 +277,7 @@ function detectIssues(file) {
   }
   const rpmCols = file.columns.filter(c => /\[RPM\]$/i.test(c.name) && c.isNumeric && c.stats && c.stats.max > 200);
   for (const col of rpmCols) {
-    if (col.stats.min === 0) add('fan_stall_' + col.index, 'warning', `${stripUnit(col.name)} reported 0 RPM at times`, `Ranged from 0 to ${col.stats.max.toFixed(0)} RPM.`,
+    if (col.stats.min === 0) add('fan_stall:' + sensorKey(col), 'warning', `${stripUnit(col.name)} reported 0 RPM at times`, `Ranged from 0 to ${col.stats.max.toFixed(0)} RPM.`,
       'This can be normal for a fan using a 0-RPM "silent" mode at low load, or it can indicate an intermittent connection or a failing fan. If this fan cools something that also ran hot in this log, check the cable seating and the fan curve in BIOS.', col, 'Motherboard');
   }
   // Gaming: capture-target sanity, stutter, and render-to-display pacing.
@@ -259,7 +290,7 @@ function detectIssues(file) {
       const frac = gaming.stutter.count / gaming.stutter.activeCount;
       if (frac > 0.08 || gaming.stutter.worstMs > 50) {
         add('frame_stutter', frac > 0.2 || gaming.stutter.worstMs > 100 ? 'serious' : 'warning', 'Frequent frame time spikes (stutter)',
-          `${gaming.stutter.count} of ${gaming.stutter.activeCount} active frames (${fmtPct(frac)}) ran past ${gaming.stutter.thresholdMs.toFixed(0)}ms — well above the session's typical ${gaming.stutter.medianMs.toFixed(1)}ms frame time. Worst frame: ${gaming.stutter.worstMs.toFixed(0)}ms.`,
+          `In ${gaming.stutter.count} of ${gaming.stutter.activeCount} active samples (${fmtPct(frac)}), the average frame time ran past ${gaming.stutter.thresholdMs.toFixed(0)}ms — well above the session's typical ${gaming.stutter.medianMs.toFixed(1)}ms. Worst sample: ${gaming.stutter.worstMs.toFixed(0)}ms.`,
           'Frame-time spikes like this are usually invisible in an average FPS number but very visible to a player. Common causes: background apps or overlays (Discord, browser, RGB software), an unstable memory overclock, CPU or GPU thermal throttling (check the Thermals tab for the same time window), an outdated GPU driver, or shader-compilation stutter in that specific game.', km.frame_time_avg, 'GPU');
       }
     }

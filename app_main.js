@@ -56,11 +56,13 @@ const SECTIONS = [
 const FILE_COLORS = ['var(--file-1)', 'var(--file-2)', 'var(--file-3)', 'var(--file-4)'];
 
 // Edit these to point at your own repo / support link before publishing your fork.
+// A link still containing the YOUR-USERNAME placeholder is hidden rather than shown broken.
 const PROJECT_LINKS = {
-  github: 'https://github.com/YOUR-USERNAME/rig-diagnostic',
+  github: 'https://github.com/J0hnm4rt1n/rig-diagnostic',
   coffee: 'https://buymeacoffee.com/YOUR-USERNAME',
   version: '1.0.0-beta',
 };
+function isLinkConfigured(url) { return !!url && !url.includes('YOUR-USERNAME'); }
 
 // Testing methodology tips — not derived from a log, just hard-won advice for getting
 // a comparison you can actually trust. Shared between the Settings page (full list) and
@@ -277,7 +279,7 @@ function renderBannerLinks() {
   els.bannerLinks.innerHTML = `
     <button class="banner-link theme-toggle" title="Theme: ${STATE.theme} — click for ${THEME_NEXT_LABEL[STATE.theme]}">${icon(THEME_ICON[STATE.theme] || 'monitor')}</button>
     <a class="banner-link" href="${PROJECT_LINKS.github}" target="_blank" rel="noopener" title="View source on GitHub">${icon('github')}</a>
-    <a class="banner-link coffee-link" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener" title="Buy me a coffee">${icon('coffee')}<span>Buy me a coffee</span></a>
+    ${isLinkConfigured(PROJECT_LINKS.coffee) ? `<a class="banner-link coffee-link" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener" title="Buy me a coffee">${icon('coffee')}<span>Buy me a coffee</span></a>` : ''}
   `;
 }
 
@@ -288,7 +290,7 @@ function renderTopbar() {
     const isPriority = ordered[0] && ordered[0].id === f.id && STATE.files.length > 1;
     const isBest = best && best.id === f.id;
     return `
-    <div class="file-chip ${isPriority ? 'priority' : ''}" data-id="${f.id}" title="${escapeHtml(f.fileName)}${f.label ? ' — labeled "' + f.label + '"' : ''}${isBest ? ' — best overall run (lowest temps, best frame performance among loaded logs)' : ''}">
+    <div class="file-chip ${isPriority ? 'priority' : ''}" data-id="${f.id}" title="${escapeHtml(f.fileName)}${f.label ? ' — labeled "' + escapeHtml(f.label) + '"' : ''}${isBest ? ' — best overall run (lowest temps, best frame performance among loaded logs)' : ''}">
       ${isBest ? `<span class="best-star">${icon('star')}</span>` : ''}
       <span class="dot" style="background:${f.color}"></span>
       <span class="fname">${escapeHtml(displayName(f))}</span>
@@ -435,7 +437,8 @@ function groupDriveColumns(file) {
   }
   return order.map(label => {
     const d = byLabel.get(label);
-    const clean = label.replace(/^drive:\s*/i, '').replace(/^s\.m\.a\.r\.t\.?:\s*/i, '');
+    const clean = driveDisplayName(label);
+    d.label = clean; // full label without the serial, used for the table cell tooltip
     d.shortLabel = clean.length > 42 ? clean.slice(0, 40) + '…' : clean;
     return d;
   });
@@ -468,6 +471,7 @@ function buildHeadroomText(file) {
   if (gpuSpec) {
     lines.push(`${gpuSpec.name}:`);
     if (km.gpu_temp) lines.push(`  Peak temp: ${km.gpu_temp.stats.max.toFixed(1)}C (~${gpuSpec.coreThrottleC}C typical throttle point)`);
+    if (km.gpu_hotspot) lines.push(`  Peak hot spot: ${km.gpu_hotspot.stats.max.toFixed(1)}C (~${gpuSpec.hotspotThrottleC || DEFAULT_GPU_HOTSPOT_LIMIT_C}C ${gpuSpec.hotspotThrottleC ? 'typical throttle point' : 'warning level'})`);
     if (km.gpu_power) lines.push(`  Peak power: ${km.gpu_power.stats.max.toFixed(0)}W (~${gpuSpec.tbpW}W reference board power)`);
   }
   return lines.join('\n');
@@ -526,11 +530,13 @@ function buildGamingText(ordered) {
   lines.push(`Capture target: ${gs.process}${gs.isGame ? '' : ' (not a game)'}`);
   if (gs.bottleneck) {
     const gpuPct = Math.round(gs.bottleneck.gpuBoundPct * 100), cpuPct = 100 - gpuPct;
-    lines.push(`CPU/GPU bottleneck: GPU-bound ${gpuPct}%, CPU-bound ${cpuPct}% (based on ${gs.bottleneck.sampleCount.toLocaleString()} active frames)`);
+    lines.push(`CPU/GPU bottleneck: GPU-bound ${gpuPct}%, CPU-bound ${cpuPct}% (based on ${gs.bottleneck.sampleCount.toLocaleString()} active samples)`);
   }
   if (gs.stutter && gs.stutter.activeCount >= 20) {
     const s = gs.stutter;
-    lines.push(`Frame pacing: ${s.count} stutter events of ${s.activeCount} active frames; typical frame time ${s.medianMs.toFixed(1)}ms; worst spike ${s.worstMs.toFixed(0)}ms`);
+    lines.push(`Frame pacing: ${s.count} of ${s.activeCount} active samples spiked; typical frame time ${s.medianMs.toFixed(1)}ms; worst sample ${s.worstMs.toFixed(0)}ms`);
+  } else if (gs.stutterTooCoarse) {
+    lines.push(`Frame pacing: not assessed — log polled every ${fmtSampleInterval(gs.sampleIntervalMs)}, too coarse to show frame-time spikes`);
   }
   if (gs.pacing) {
     lines.push(`Presented vs. displayed: ${gs.pacing.presentedAvg.toFixed(0)} FPS presented, ${gs.pacing.displayedAvg.toFixed(0)} FPS displayed (${fmtPct(gs.pacing.gapPct)} ${gs.pacing.gapPct >= 0 ? 'lower' : 'higher'})`);
@@ -660,8 +666,14 @@ function specHeadroomHtml(file) {
   if (gpuSpec) {
     let b = `<div style="flex:1;min-width:240px;"><div style="font-weight:600;font-size:13.5px;margin-bottom:8px;">${escapeHtml(gpuSpec.name)}</div>`;
     if (km.gpu_temp) { const p = km.gpu_temp.stats.max / gpuSpec.coreThrottleC; b += headroomBarHtml('Peak temp vs. throttle point', km.gpu_temp.stats.max, gpuSpec.coreThrottleC, '°C', p > 0.95 ? 'critical' : p > 0.88 ? 'warning' : 'good'); }
+    if (km.gpu_hotspot) {
+      const limit = gpuSpec.hotspotThrottleC || DEFAULT_GPU_HOTSPOT_LIMIT_C;
+      const p = km.gpu_hotspot.stats.max / limit;
+      b += headroomBarHtml(gpuSpec.hotspotThrottleC ? 'Peak hot spot vs. throttle point' : 'Peak hot spot vs. warning level', km.gpu_hotspot.stats.max, limit, '°C', p > 0.95 ? 'critical' : p > 0.88 ? 'warning' : 'good');
+    }
     if (km.gpu_power) { const p = km.gpu_power.stats.max / gpuSpec.tbpW; b += headroomBarHtml('Peak power vs. reference board power', km.gpu_power.stats.max, gpuSpec.tbpW, 'W', p > 1.1 ? 'accent' : 'good'); }
-    if (gpuSpec.note) b += `<div class="footnote">${escapeHtml(gpuSpec.note)}</div>`;
+    const gpuNote = gpuSpecNoteFor(gpuSpec, !!km.gpu_hotspot);
+    if (gpuNote) b += `<div class="footnote">${escapeHtml(gpuNote)}</div>`;
     b += `</div>`;
     blocks.push(b);
   }
@@ -850,17 +862,21 @@ function bottleneckPanelHtml(gs) {
       <span class="legend-item"><span class="legend-swatch" style="background:var(--file-2)"></span>CPU-bound ${cpuPct}%</span>
     </div>
     <div class="issue-detail">${verdict}</div>
-    <div class="footnote" style="margin-top:6px;">Based on ${sampleCount.toLocaleString()} active frames, comparing per-frame GPU Busy vs. CPU Busy time. A simplified heuristic, not a cycle-accurate profile.</div>`;
+    <div class="footnote" style="margin-top:6px;">Based on ${sampleCount.toLocaleString()} active log samples${gs.sampleIntervalMs ? ` (one every ${fmtSampleInterval(gs.sampleIntervalMs)})` : ''}, comparing average GPU Busy vs. CPU Busy time in each. A simplified heuristic, not a cycle-accurate profile.</div>`;
 }
 
+function fmtSampleInterval(ms) { return ms >= 1000 ? `${+(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`; }
+
 function stutterPanelHtml(gs) {
+  if (gs.stutterTooCoarse) return `<div class="issue-detail">Frame pacing can't be assessed from this log. It was recorded at one sample every ${fmtSampleInterval(gs.sampleIntervalMs)}, and each sample averages every frame rendered in that time, so short stutters get averaged away.</div>
+    <div class="footnote" style="margin-top:6px;">To see frame-time spikes, set HWiNFO's sensor polling period to 1000 ms or less before logging.</div>`;
   if (!gs.stutter || gs.stutter.activeCount < 20) return '<div class="footnote">Not enough active-gameplay samples to assess frame pacing.</div>';
   const s = gs.stutter;
   const frac = s.count / s.activeCount;
   const tone = frac > 0.2 || s.worstMs > 100 ? 'critical' : frac > 0.08 || s.worstMs > 50 ? 'warning' : 'good';
   return `<div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
       <div class="tile" style="flex:1;min-width:140px;">
-        <div class="tile-label">Stutter events</div>
+        <div class="tile-label">Samples with spikes</div>
         <div class="tile-value-row"><span class="tile-value tnum" style="color:var(--${tone});">${s.count}</span><span class="tile-unit">of ${s.activeCount}</span></div>
       </div>
       <div class="tile" style="flex:1;min-width:140px;">
@@ -873,7 +889,7 @@ function stutterPanelHtml(gs) {
         ${s.worstElapsedMs != null ? `<div class="footnote">at ${fmtElapsed(s.worstElapsedMs)} elapsed</div>` : ''}
       </div>
     </div>
-    <div class="footnote" style="margin-top:10px;">A frame counts as a stutter here if it took longer than ${s.thresholdMs.toFixed(0)}ms — roughly double this session's own typical frame time.</div>`;
+    <div class="footnote" style="margin-top:10px;">Each log sample${gs.sampleIntervalMs ? ` (one every ${fmtSampleInterval(gs.sampleIntervalMs)})` : ''} holds the average frame time over that interval. A sample counts as a spike if that average exceeded ${s.thresholdMs.toFixed(0)}ms — roughly double this session's typical frame time. A single hitched frame barely moves an average, so this catches sustained slowdowns more than one-frame stutters.</div>`;
 }
 
 function renderGaming(container, ordered) {
@@ -912,7 +928,7 @@ function renderGaming(container, ordered) {
     const panel = document.createElement('div');
     panel.className = 'panel';
     panel.innerHTML = `<div class="panel-head"><h3>Across loaded logs</h3></div>
-      <div class="table-scroll"><table class="data-table"><thead><tr><th>Log</th><th>Capture target</th><th>GPU-bound</th><th>Stutter events</th><th>Worst spike</th></tr></thead><tbody>
+      <div class="table-scroll"><table class="data-table"><thead><tr><th>Log</th><th>Capture target</th><th>GPU-bound</th><th>Samples with spikes</th><th>Worst sample</th></tr></thead><tbody>
       ${rows.map(({ f, gs: g }) => `<tr>
         <td>${escapeHtml(displayName(f))}</td>
         <td>${g.process ? escapeHtml(g.process) + (g.isGame ? '' : ' (not a game)') : '—'}</td>
@@ -988,7 +1004,7 @@ function renderNetwork(container, ordered) {
   COPY_REGISTRY['network-page'] = buildNetworkText(ordered);
   container.innerHTML = `<div class="page-head"><div><h1>Network & PCIe</h1><p>Link throughput plus PCI Express link-error counters, which are a good early signal of a seating or signal-integrity problem.</p></div>${copyButtonHtml('network-page', 'network and PCIe')}</div>
   <div id="net-charts"></div>
-  <div class="panel" id="pcie-panel"><div class="panel-head"><h3>PCI Express error counters</h3><span class="sub">most recent log — non-zero is worth investigating</span></div><div class="table-scroll" id="pcie-table"></div></div>`;
+  <div class="panel" id="pcie-panel"><div class="panel-head"><h3>PCI Express error counters</h3><span class="sub">most recent log — these are running totals; an error counter that rises during the log is worth investigating</span></div><div class="table-scroll" id="pcie-table"></div></div>`;
 
   const newest = ordered[0];
   const dlCols = findAllNumeric(newest, /^Current DL rate/i);
@@ -1017,12 +1033,17 @@ function renderNetwork(container, ordered) {
     if (idleCount) { const note = document.createElement('div'); note.className = 'footnote'; note.style.marginTop = '10px'; note.textContent = `${idleCount} additional network interface${idleCount > 1 ? 's' : ''} carried no traffic during this log and ${idleCount > 1 ? 'are' : 'is'} hidden.`; netChartsEl.appendChild(note); }
   } else netChartsEl.innerHTML = '<div class="footnote">No network throughput sensors were found in the loaded log(s).</div>';
 
-  const pcieErrPatterns = [/^Correctable Error Count/i, /^Non-Fatal Error Count/i, /^Fatal Error Count/i, /^Bad DLLP Count/i, /^Bad TLP Count/i, /^LCRC Error Count/i, /^Replay Count/i, /^Recovery Count/i, /^Receiver Errors/i, /^NAKs Sent Count/i, /^NAKs Received Count/i];
   const pcieTable = container.querySelector('#pcie-table');
   let rows = [];
-  for (const re of pcieErrPatterns) for (const col of findAllNumeric(newest, re)) rows.push([stripUnit(col.name), col.stats.max]);
+  for (const re of PCIE_FAULT_PATTERNS) for (const col of findAllNumeric(newest, re)) rows.push({ name: stripUnit(col.name), col, benign: false });
+  for (const col of findAllNumeric(newest, /^Recovery Count/i)) rows.push({ name: stripUnit(col.name), col, benign: true });
+  const changeTag = (r) => {
+    const rise = counterIncrease(r.col);
+    if (rise <= 0) return '<span class="delta-tag better">0</span>';
+    return r.benign ? `<span class="delta-tag">+${rise}</span>` : `<span class="delta-tag worse">+${rise}</span>`;
+  };
   if (!rows.length) pcieTable.innerHTML = '<div class="footnote" style="padding:10px 0;">No PCIe error counters were found in this log.</div>';
-  else pcieTable.innerHTML = `<table class="data-table"><thead><tr><th>Counter</th><th>Max observed</th></tr></thead><tbody>${rows.map(([n, v]) => `<tr><td>${n}</td><td class="mono tnum">${v > 0 ? `<span class="delta-tag worse">${v}</span>` : '<span class="delta-tag better">0</span>'}</td></tr>`).join('')}</tbody></table>`;
+  else pcieTable.innerHTML = `<table class="data-table"><thead><tr><th>Counter</th><th>At start</th><th>At end</th><th>Change during log</th></tr></thead><tbody>${rows.map(r => `<tr><td>${escapeHtml(r.name)}${r.benign ? ' <span class="footnote">(usually harmless — link power-state changes)</span>' : ''}</td><td class="mono tnum">${r.col.stats.min}</td><td class="mono tnum">${r.col.stats.max}</td><td class="mono tnum">${changeTag(r)}</td></tr>`).join('')}</tbody></table>`;
 }
 
 // Small colored ↑/↓/→ glyph shown between two adjacent value columns in the Metric
@@ -1152,7 +1173,7 @@ function renderCompare(container, ordered) {
       }).join('');
       return `<div class="verdict-card ${isBest ? 'is-best' : ''}">
         <div class="vc-head">${isBest ? `<span class="best-star">${icon('star')}</span>` : ''}<span>${escapeHtml(displayName(f).slice(0, 22))}</span></div>
-        <div class="vc-score ${scoreTone(s.composite)}">${s.composite}</div>
+        <div class="vc-score ${scoreTone(s.composite)}">${s.composite == null ? '—' : s.composite}</div>
         ${rows}
       </div>`;
     }).join('');
@@ -1362,8 +1383,9 @@ function buildReportText(ordered) {
   if (gs && gs.process) {
     lines.push('GAMING (most recent log)');
     lines.push(`Capture target: ${gs.process}${gs.isGame ? '' : ' (not a game — desktop/system capture)'}`);
-    if (gs.bottleneck) lines.push(`Bottleneck: GPU-bound ${Math.round(gs.bottleneck.gpuBoundPct * 100)}% / CPU-bound ${Math.round((1 - gs.bottleneck.gpuBoundPct) * 100)}% of active frames`);
-    if (gs.stutter) lines.push(`Stutters: ${gs.stutter.count} of ${gs.stutter.activeCount} active frames exceeded ${gs.stutter.thresholdMs.toFixed(0)}ms (worst ${gs.stutter.worstMs.toFixed(0)}ms)`);
+    if (gs.bottleneck) lines.push(`Bottleneck: GPU-bound ${Math.round(gs.bottleneck.gpuBoundPct * 100)}% / CPU-bound ${Math.round((1 - gs.bottleneck.gpuBoundPct) * 100)}% of active samples`);
+    if (gs.stutter) lines.push(`Frame-time spikes: ${gs.stutter.count} of ${gs.stutter.activeCount} active samples averaged over ${gs.stutter.thresholdMs.toFixed(0)}ms (worst ${gs.stutter.worstMs.toFixed(0)}ms)`);
+    else if (gs.stutterTooCoarse) lines.push(`Frame pacing: not assessed — log polled every ${fmtSampleInterval(gs.sampleIntervalMs)}, too coarse to show frame-time spikes`);
     if (gs.pacing) lines.push(`Presented ${gs.pacing.presentedAvg.toFixed(0)} FPS vs. displayed ${gs.pacing.displayedAvg.toFixed(0)} FPS (${fmtPct(gs.pacing.gapPct)} gap)`);
     lines.push('');
   }
@@ -1489,7 +1511,7 @@ function renderSettings(container) {
       <p class="footnote" style="margin:0 0 10px;">Free and open source, licensed under the MIT License. Everything runs client-side in your browser — no server, no accounts, no telemetry, and your log files are never uploaded anywhere.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
         <a class="btn ghost" href="${PROJECT_LINKS.github}" target="_blank" rel="noopener">${icon('github')}<span>Source on GitHub</span></a>
-        <a class="btn ghost" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener">${icon('coffee')}<span>Buy me a coffee</span></a>
+        ${isLinkConfigured(PROJECT_LINKS.coffee) ? `<a class="btn ghost" href="${PROJECT_LINKS.coffee}" target="_blank" rel="noopener">${icon('coffee')}<span>Buy me a coffee</span></a>` : ''}
       </div>
     </div>
   `;
